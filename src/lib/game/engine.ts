@@ -17,10 +17,11 @@ export function updateGame(
   maze: Maze,
   gameInput: GameInput,
   deltaTime: number,
+  sensitivityMul = 1.0,
 ): LocalGameState {
   if (state.status !== "playing") return state;
 
-  const sensitivity = 420;
+  const sensitivity = 420 * sensitivityMul;
   const friction = 0.985;
 
   const velocity = {

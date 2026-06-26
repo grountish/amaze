@@ -10,9 +10,11 @@
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
   import { startBotProgressLoop } from '$lib/input/botInput';
-  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients } from '$lib/firebase/rooms';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState } from '$lib/firebase/types';
+  import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
+  import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
 
   export let roomId: string;
   export let playerId: string;
@@ -48,6 +50,16 @@
   // Shortcut gate state
   let shortcutState: ShortcutState | null = null;
   let inShortcut = false;
+
+  // Evolving maze grid
+  let cellGrid: CellGrid | null = null;
+  let lastEvolutionTick = 0;
+
+  // Nutrients & speed boosts
+  let nutrients: Record<string, NutrientData> = {};
+  let collectedNutrients = new Set<string>();
+  type SpeedBoost = { expires: number; factor: number };
+  let speedBoosts: SpeedBoost[] = [];
   let finishedSynced = false;
   let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
@@ -68,13 +80,57 @@
     const maze = defaultMaze;
 
     // Clear with dark background
-    ctx.fillStyle = '#1a1a2e';
+    ctx.fillStyle = '#06060f';
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Draw walls
-    ctx.fillStyle = '#4a4a6a';
-    for (const wall of maze.walls) {
-      ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+    const drawNow = Date.now();
+
+    if (cellGrid) {
+      // ── Pheromone heatmap ──────────────────────────────────
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          const i = r * GRID_COLS + c;
+          const ph = cellGrid.pheromone[i];
+          if (ph < 0.04) continue;
+          ctx.globalAlpha = Math.min(0.55, ph * 0.7);
+          ctx.fillStyle = `hsl(${30 + ph * 20}, 100%, 60%)`;
+          ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      // ── Wall cells ─────────────────────────────────────────
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          const i = r * GRID_COLS + c;
+          if (!cellGrid.walls[i]) continue;
+          const ev = cellGrid.evolved[i];
+          ctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
+          ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+        }
+      }
+
+      // ── Nutrients ──────────────────────────────────────────
+      for (const [, n] of Object.entries(nutrients)) {
+        if (n.expiresAt < drawNow) continue;
+        const nx = n.col * CELL_SIZE + CELL_SIZE / 2;
+        const ny = n.row * CELL_SIZE + CELL_SIZE / 2;
+        const pulse = 0.6 + 0.4 * Math.sin(drawNow / 300 + n.col);
+        ctx.save();
+        ctx.shadowColor = '#ffd700';
+        ctx.shadowBlur = 14 * pulse;
+        ctx.beginPath();
+        ctx.arc(nx, ny, 5 * pulse, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
+        ctx.fill();
+        ctx.restore();
+      }
+    } else {
+      // Fallback: static walls while grid initialises
+      ctx.fillStyle = '#2e2e50';
+      for (const wall of defaultMaze.walls) {
+        ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+      }
     }
 
     // ── Shortcut gate ──────────────────────────────────────────
@@ -232,11 +288,37 @@
       ctx.restore();
     }
 
-    // Draw progress text bottom-left
+    // HUD — bottom bar
     if (gameState) {
       ctx.fillStyle = '#ffffff';
       ctx.font = '16px monospace';
       ctx.fillText(`Progress: ${Math.round(gameState.progress)}%`, 30, CANVAS_HEIGHT - 30);
+
+      // Speed boost indicator
+      const now_hud = Date.now();
+      const activeBoosts = speedBoosts.filter((b) => b.expires > now_hud);
+      if (activeBoosts.length > 0) {
+        const remaining = Math.max(0, Math.ceil((activeBoosts[0].expires - now_hud) / 1000));
+        const factor = activeBoosts.reduce((f, b) => f * b.factor, 1.0);
+        ctx.save();
+        ctx.shadowColor = '#ffd700';
+        ctx.shadowBlur = 8;
+        ctx.fillStyle = '#ffd700';
+        ctx.font = 'bold 15px monospace';
+        ctx.fillText(`⚡ ×${factor.toFixed(1)} ${remaining}s`, CANVAS_WIDTH - 140, CANVAS_HEIGHT - 30);
+        ctx.restore();
+      }
+
+      // Evolution indicator — flashes briefly when maze just evolved
+      const anyEvolved = cellGrid && cellGrid.evolved.some((v) => v !== 0);
+      if (anyEvolved) {
+        ctx.save();
+        ctx.globalAlpha = 0.7;
+        ctx.fillStyle = '#44aaff';
+        ctx.font = '13px monospace';
+        ctx.fillText('MAZE EVOLVING', CANVAS_WIDTH / 2 - 55, CANVAS_HEIGHT - 30);
+        ctx.restore();
+      }
     }
 
     // Debug: draw input vector as arrow from ball center
@@ -281,16 +363,64 @@
     // Bot skips physics — progress is driven by startBotProgressLoop
     if (inputSource !== 'bot') {
       const currentInput = get(input);
-      // If shortcut is collapsed, inject its gap wall into physics
       const nowMs = Date.now();
+
+      // Speed boost from nutrients
+      speedBoosts = speedBoosts.filter((b) => b.expires > nowMs);
+      const speedFactor = speedBoosts.reduce((f, b) => f * b.factor, 1.0);
+
+      // Pheromone: deposit at local ball + all opponent positions
+      if (cellGrid && gameState.status === 'playing') {
+        depositPheromone(cellGrid, gameState.ball.position.x, gameState.ball.position.y);
+        for (const pl of get(players)) {
+          if (pl.id === playerId || pl.x == null || pl.y == null) continue;
+          depositPheromone(cellGrid, pl.x, pl.y, 0.04);
+        }
+        decayPheromone(cellGrid, deltaTime);
+
+        // Evolution tick — host-driven
+        if (nowMs - lastEvolutionTick > EVOLUTION_INTERVAL) {
+          lastEvolutionTick = nowMs;
+          const sortedOnline = get(players).filter((p) => p.online).sort((a, b) => a.id.localeCompare(b.id));
+          if (sortedOnline[0]?.id === playerId) {
+            evolveGrid(cellGrid, defaultMaze);
+            updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
+            const candidates = findNutrientPositions(cellGrid, 3);
+            syncNutrients(roomId, candidates).catch(console.error);
+          }
+        }
+
+        // Nutrient collection
+        for (const [id, n] of Object.entries(nutrients)) {
+          if (collectedNutrients.has(id)) continue;
+          if (n.expiresAt < nowMs) continue;
+          const nx = (n.col + 0.5) * CELL_SIZE;
+          const ny = (n.row + 0.5) * CELL_SIZE;
+          const dx = gameState.ball.position.x - nx;
+          const dy = gameState.ball.position.y - ny;
+          if (dx * dx + dy * dy < 484) {
+            collectedNutrients.add(id);
+            collectNutrient(roomId, id).then((ok) => {
+              if (ok) speedBoosts = [...speedBoosts, { expires: nowMs + 8000, factor: 1 + n.value * 0.2 }];
+              else collectedNutrients.delete(id);
+            }).catch(console.error);
+          }
+        }
+      }
+
+      // Build physics walls from grid + optional shortcut collapse
       const shortcutCollapsed =
         defaultMaze.shortcut != null &&
         shortcutState?.collapseUntil != null &&
         shortcutState.collapseUntil > nowMs;
-      const activeMaze = shortcutCollapsed
-        ? { ...defaultMaze, walls: [...defaultMaze.walls, defaultMaze.shortcut!.gapWall] }
-        : defaultMaze;
-      gameState = updateGame(gameState, activeMaze, currentInput, deltaTime);
+      const localWalls = cellGrid
+        ? getLocalWalls(cellGrid, gameState.ball.position.x, gameState.ball.position.y)
+        : defaultMaze.walls;
+      if (shortcutCollapsed && defaultMaze.shortcut) {
+        localWalls.push(defaultMaze.shortcut.gapWall);
+      }
+      const activeMaze = { ...defaultMaze, walls: localWalls };
+      gameState = updateGame(gameState, activeMaze, currentInput, deltaTime, speedFactor);
 
       // Shortcut zone entry/exit detection
       if (defaultMaze.shortcut) {
@@ -341,6 +471,11 @@
     gameState = { ...initial, status: 'playing', startedAt: gameStartTime };
     localGame.set(gameState);
 
+    // Initialise evolving grid
+    cellGrid = createCellGrid();
+    initGridFromMaze(cellGrid, defaultMaze);
+    if (defaultMaze.shortcut) protectZone(cellGrid, defaultMaze.shortcut.zone);
+
     if (inputSource === 'keyboard') {
       cleanupFns.push(startKeyboardInput());
     } else if (inputSource === 'motion') {
@@ -386,6 +521,16 @@
     const botIntervals: ReturnType<typeof setInterval>[] = [];
     cleanupFns.push(
       subscribeToShortcut(roomId, (s) => { shortcutState = s; }),
+
+      subscribeToMazeGrid(roomId, (b64) => {
+        if (b64 && cellGrid) {
+          cellGrid.walls = deserializeWalls(b64);
+          // Fade evolved markers after receiving remote update
+          cellGrid.evolved.fill(0);
+        }
+      }),
+
+      subscribeToNutrients(roomId, (n) => { nutrients = n; }),
 
       subscribeToPlayers(roomId, (p) => {
         players.set(p);

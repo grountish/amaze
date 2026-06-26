@@ -16,6 +16,7 @@ export type Room = {
   finishedAt?: number;
   winnerId?: string;
   shortcut?: ShortcutState;
+  mazeGrid?: string; // base64-encoded wall bitmap
 };
 
 export type Player = {

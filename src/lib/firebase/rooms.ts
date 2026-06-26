@@ -222,3 +222,68 @@ export async function addBotPlayer(roomId: string): Promise<string> {
   await set(ref(db(), `rooms/${roomId}/players/${botId}`), botData);
   return botId;
 }
+
+// ── Evolving maze grid ─────────────────────────────────────────
+
+export async function updateMazeGrid(roomId: string, wallsB64: string): Promise<void> {
+  await update(ref(db(), `rooms/${roomId}`), { mazeGrid: wallsB64 });
+}
+
+export function subscribeToMazeGrid(
+  roomId: string,
+  callback: (wallsB64: string | null) => void,
+): () => void {
+  return onValue(ref(db(), `rooms/${roomId}/mazeGrid`), (snap) => callback(snap.val()));
+}
+
+// ── Nutrients ──────────────────────────────────────────────────
+
+import type { NutrientData } from '$lib/game/cellularMaze';
+
+export async function syncNutrients(
+  roomId: string,
+  candidates: NutrientData[],
+): Promise<void> {
+  const nutrientRef = ref(db(), `rooms/${roomId}/nutrients`);
+  const snap = await get(nutrientRef);
+  const now = Date.now();
+  const existing: Record<string, NutrientData> = snap.val() ?? {};
+
+  const updates: Record<string, NutrientData | null> = {};
+
+  // Expire old nutrients
+  for (const [k, v] of Object.entries(existing)) {
+    if (v.expiresAt < now) updates[k] = null;
+  }
+
+  const activeCount = Object.values(existing).filter((v) => v.expiresAt >= now).length;
+  const toAdd = Math.min(candidates.length, Math.max(0, 4 - activeCount));
+
+  for (let i = 0; i < toAdd; i++) {
+    updates[`n_${now}_${i}`] = { ...candidates[i], expiresAt: now + 18000 };
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await update(nutrientRef, updates);
+  }
+}
+
+export async function collectNutrient(
+  roomId: string,
+  nutrientId: string,
+): Promise<boolean> {
+  let collected = false;
+  await runTransaction(ref(db(), `rooms/${roomId}/nutrients/${nutrientId}`), (current) => {
+    if (current == null) return undefined; // already gone
+    collected = true;
+    return null;
+  });
+  return collected;
+}
+
+export function subscribeToNutrients(
+  roomId: string,
+  callback: (nutrients: Record<string, NutrientData>) => void,
+): () => void {
+  return onValue(ref(db(), `rooms/${roomId}/nutrients`), (snap) => callback(snap.val() ?? {}));
+}
