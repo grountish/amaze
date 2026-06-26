@@ -5,7 +5,9 @@ import {
   get,
   push,
   update,
+  remove,
   onValue,
+  onDisconnect,
 } from "firebase/database";
 import { getFirebaseApp } from "./app";
 import { getCurrentUser } from "./auth";
@@ -54,6 +56,10 @@ export async function createRoom(playerName: string, inputSource: InputSource): 
   return roomId;
 }
 
+export async function deleteRoom(roomId: string): Promise<void> {
+  await remove(ref(db(), `rooms/${roomId}`));
+}
+
 export async function ensureRoom(roomId: string): Promise<void> {
   const roomRef = ref(db(), `rooms/${roomId}`);
   const snapshot = await get(roomRef);
@@ -82,7 +88,10 @@ export async function joinRoom(roomId: string, playerName: string, inputSource: 
     lastSeenAt: now,
   };
 
-  await set(ref(db(), `rooms/${roomId}/players/${user.uid}`), playerData);
+  const playerRef = ref(db(), `rooms/${roomId}/players/${user.uid}`);
+  await set(playerRef, playerData);
+  // Auto-remove player from Firebase if they close the tab or lose connection
+  onDisconnect(playerRef).remove();
 }
 
 export function subscribeToRoom(roomId: string, callback: (room: Room | null) => void): () => void {

@@ -7,7 +7,7 @@
   import { currentPlayerId } from '$lib/stores/playerStore';
   import { debugMode } from '$lib/stores/gameStore';
   import { room } from '$lib/stores/roomStore';
-  import { subscribeToRoom } from '$lib/firebase/rooms';
+  import { subscribeToRoom, deleteRoom } from '$lib/firebase/rooms';
   import type { InputSource } from '$lib/firebase/types';
 
   const dispatch = createEventDispatcher();
@@ -83,7 +83,7 @@
   {#if showLeaderboard}
     <div class="leaderboard-overlay">
       <Leaderboard {roomId} />
-      <button class="home-btn" on:click={() => dispatch('home')}>Back to Home</button>
+      <button class="home-btn" on:click={async () => { await deleteRoom(roomId); dispatch('home'); }}>Back to Home</button>
     </div>
   {/if}
 

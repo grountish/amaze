@@ -33,6 +33,7 @@
   let cleanupFns: Array<() => void> = [];
   let lastProgressSync: number = 0;
   let gameStartTime: number = 0;
+  let lastSyncedPos = { x: -9999, y: -9999 };
 
   // Lerped display positions for opponents (smooths network lag)
   const opponentDisplayPos = new Map<string, { x: number; y: number }>();
@@ -186,17 +187,17 @@
       gameState = updateGame(gameState, defaultMaze, currentInput, deltaTime);
       localGame.set(gameState);
 
-      // Sync position + progress to Firebase at ~10fps
+      // Sync position + progress to Firebase at ~20fps, skip if barely moved
       if (now - lastProgressSync > POSITION_SYNC_THROTTLE) {
-        lastProgressSync = now;
-        lastKnownProgress = gameState.progress;
-        updatePlayerPosition(
-          roomId,
-          playerId,
-          gameState.ball.position.x,
-          gameState.ball.position.y,
-          gameState.progress,
-        ).catch(console.error);
+        const { x, y } = gameState.ball.position;
+        const dx = x - lastSyncedPos.x;
+        const dy = y - lastSyncedPos.y;
+        if (dx * dx + dy * dy >= 4) {
+          lastProgressSync = now;
+          lastKnownProgress = gameState.progress;
+          lastSyncedPos = { x, y };
+          updatePlayerPosition(roomId, playerId, x, y, gameState.progress).catch(console.error);
+        }
       }
 
       // Handle finish (once)
@@ -244,14 +245,14 @@
             localGame.set(gameState);
             const now = performance.now();
             if (now - lastProgressSync > POSITION_SYNC_THROTTLE) {
-              lastProgressSync = now;
-              updatePlayerPosition(
-                roomId,
-                playerId,
-                gameState.ball.position.x,
-                gameState.ball.position.y,
-                progress,
-              ).catch(console.error);
+              const { x, y } = gameState.ball.position;
+              const dx = x - lastSyncedPos.x;
+              const dy = y - lastSyncedPos.y;
+              if (dx * dx + dy * dy >= 4) {
+                lastProgressSync = now;
+                lastSyncedPos = { x, y };
+                updatePlayerPosition(roomId, playerId, x, y, progress).catch(console.error);
+              }
             }
           }
         })
