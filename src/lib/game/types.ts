@@ -27,6 +27,13 @@ export type Hole = {
   radius: number;
 };
 
+export type Shortcut = {
+  // detection zone (larger than the visual gap)
+  zone: { x: number; y: number; width: number; height: number };
+  // wall segment that fills the gap when collapsed
+  gapWall: Wall;
+};
+
 export type Maze = {
   id: string;
   width: number;
@@ -35,6 +42,7 @@ export type Maze = {
   hole: Hole;
   walls: Wall[];
   checkpoints: Vector2[];
+  shortcut?: Shortcut;
 };
 
 export type LocalGameState = {

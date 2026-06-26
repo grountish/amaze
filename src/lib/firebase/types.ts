@@ -2,6 +2,11 @@ export type RoomStatus = "waiting" | "countdown" | "playing" | "finished";
 
 export type InputSource = "motion" | "keyboard" | "joystick" | "bot";
 
+export type ShortcutState = {
+  occupant: string | null;
+  collapseUntil: number | null;
+};
+
 export type Room = {
   id: string;
   status: RoomStatus;
@@ -10,6 +15,7 @@ export type Room = {
   startedAt?: number;
   finishedAt?: number;
   winnerId?: string;
+  shortcut?: ShortcutState;
 };
 
 export type Player = {

@@ -8,10 +8,11 @@ import {
   remove,
   onValue,
   onDisconnect,
+  runTransaction,
 } from "firebase/database";
 import { getFirebaseApp } from "./app";
 import { getCurrentUser } from "./auth";
-import type { Room, Player, GameEvent, InputSource } from "./types";
+import type { Room, Player, GameEvent, InputSource, ShortcutState } from "./types";
 
 export const SINGLE_ROOM_ID = "MAIN";
 
@@ -58,6 +59,48 @@ export async function createRoom(playerName: string, inputSource: InputSource): 
 
 export async function deleteRoom(roomId: string): Promise<void> {
   await remove(ref(db(), `rooms/${roomId}`));
+}
+
+// Shortcut gate — atomic transaction returns: 'claimed' | 'collapsed' | 'blocked'
+export async function enterShortcut(
+  roomId: string,
+  playerId: string,
+): Promise<"claimed" | "collapsed" | "blocked"> {
+  const shortcutRef = ref(db(), `rooms/${roomId}/shortcut`);
+  let outcome: "claimed" | "collapsed" | "blocked" = "claimed";
+
+  await runTransaction(shortcutRef, (current) => {
+    const now = Date.now();
+    if (current?.collapseUntil && current.collapseUntil > now) {
+      outcome = "blocked";
+      return current;
+    }
+    if (current?.occupant && current.occupant !== playerId) {
+      outcome = "collapsed";
+      return { occupant: null, collapseUntil: now + 5000 };
+    }
+    outcome = "claimed";
+    return { occupant: playerId, collapseUntil: null };
+  });
+
+  return outcome;
+}
+
+export async function exitShortcut(roomId: string, playerId: string): Promise<void> {
+  const shortcutRef = ref(db(), `rooms/${roomId}/shortcut`);
+  await runTransaction(shortcutRef, (current) => {
+    if (current?.occupant === playerId) {
+      return { ...current, occupant: null };
+    }
+    return current;
+  });
+}
+
+export function subscribeToShortcut(
+  roomId: string,
+  callback: (state: ShortcutState | null) => void,
+): () => void {
+  return onValue(ref(db(), `rooms/${roomId}/shortcut`), (snap) => callback(snap.val()));
 }
 
 export async function ensureRoom(roomId: string): Promise<void> {

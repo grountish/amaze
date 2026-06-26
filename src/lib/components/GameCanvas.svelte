@@ -10,9 +10,9 @@
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
   import { startBotProgressLoop } from '$lib/input/botInput';
-  import { updatePlayerPosition, finishPlayer, subscribeToPlayers } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut } from '$lib/firebase/rooms';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
-  import type { InputSource } from '$lib/firebase/types';
+  import type { InputSource, ShortcutState } from '$lib/firebase/types';
 
   export let roomId: string;
   export let playerId: string;
@@ -37,6 +37,17 @@
 
   // Lerped display positions for opponents (smooths network lag)
   const opponentDisplayPos = new Map<string, { x: number; y: number }>();
+
+  // Pheromone trail history: playerId → [{x,y,t}]
+  type TrailPoint = { x: number; y: number; t: number };
+  const TRAIL_MAX_AGE = 3500;
+  const TRAIL_MAX_POINTS = 80;
+  const opponentTrails = new Map<string, TrailPoint[]>();
+  let localTrail: TrailPoint[] = [];
+
+  // Shortcut gate state
+  let shortcutState: ShortcutState | null = null;
+  let inShortcut = false;
   let finishedSynced = false;
   let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
@@ -66,26 +77,95 @@
       ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
     }
 
-    // Draw hole: dark circle with gold border
-    ctx.beginPath();
-    ctx.arc(maze.hole.x, maze.hole.y, maze.hole.radius, 0, Math.PI * 2);
-    ctx.fillStyle = '#0a0a1a';
-    ctx.fill();
-    ctx.strokeStyle = '#ffd700';
-    ctx.lineWidth = 3;
-    ctx.stroke();
+    // ── Shortcut gate ──────────────────────────────────────────
+    if (maze.shortcut) {
+      const { zone, gapWall } = maze.shortcut;
+      const now = Date.now();
+      const collapsed = shortcutState?.collapseUntil != null && shortcutState.collapseUntil > now;
+      const cx = gapWall.x + gapWall.width / 2;
+      const cy = gapWall.y + gapWall.height / 2;
 
-    // Draw start position marker
-    ctx.beginPath();
-    ctx.arc(maze.startPosition.x, maze.startPosition.y, 8, 0, Math.PI * 2);
-    ctx.globalAlpha = 0.6;
-    ctx.fillStyle = '#00ff88';
-    ctx.fill();
-    ctx.globalAlpha = 1;
+      if (collapsed) {
+        // Red pulsing wall + countdown
+        const pulse = 0.6 + 0.4 * Math.sin(now / 120);
+        ctx.save();
+        ctx.shadowColor = '#ff4444';
+        ctx.shadowBlur = 16 * pulse;
+        ctx.fillStyle = `rgba(200, 40, 40, ${pulse})`;
+        ctx.fillRect(gapWall.x, gapWall.y, gapWall.width, gapWall.height);
+        ctx.restore();
+        const secsLeft = Math.ceil((shortcutState!.collapseUntil! - now) / 1000);
+        ctx.fillStyle = '#ff8888';
+        ctx.font = 'bold 11px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${secsLeft}s`, cx, cy - 14);
+      } else {
+        // Green glowing open gate
+        const pulse = 0.5 + 0.5 * Math.sin(now / 400);
+        ctx.save();
+        ctx.shadowColor = '#00ffaa';
+        ctx.shadowBlur = 18 * pulse;
+        ctx.strokeStyle = `rgba(0, 255, 170, ${0.4 + 0.4 * pulse})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(gapWall.x, gapWall.y + gapWall.height / 2);
+        ctx.lineTo(gapWall.x + gapWall.width, gapWall.y + gapWall.height / 2);
+        ctx.stroke();
+        ctx.restore();
+        // Label
+        ctx.globalAlpha = 0.5 + 0.3 * pulse;
+        ctx.fillStyle = '#00ffaa';
+        ctx.font = 'bold 10px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText('SHORTCUT', cx, cy - 14);
+        ctx.globalAlpha = 1;
+      }
+    }
 
-    // Draw opponents with client-side lerp to smooth network lag
+    // ── Pheromone trails ───────────────────────────────────────
+    const now = Date.now();
+
+    // Local player trail
+    if (gameState) {
+      const lp = gameState.ball.position;
+      localTrail.push({ x: lp.x, y: lp.y, t: now });
+      if (localTrail.length > TRAIL_MAX_POINTS) localTrail.shift();
+      for (const pt of localTrail) {
+        const age = now - pt.t;
+        if (age > TRAIL_MAX_AGE) continue;
+        const alpha = (1 - age / TRAIL_MAX_AGE) * 0.25;
+        const r = 6 * (1 - age / TRAIL_MAX_AGE);
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, Math.max(1, r), 0, Math.PI * 2);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Opponent trails
     const allPlayers = get(players);
-    // Exponential smoothing: ~90% catch-up in 150ms at 60fps
+    for (const player of allPlayers) {
+      if (player.id === playerId) continue;
+      if (player.x == null || player.y == null) continue;
+      const trail = opponentTrails.get(player.id) ?? [];
+      const color = getPlayerColor(player.id);
+      for (const pt of trail) {
+        const age = now - pt.t;
+        if (age > TRAIL_MAX_AGE) continue;
+        const alpha = (1 - age / TRAIL_MAX_AGE) * 0.22;
+        const r = 6 * (1 - age / TRAIL_MAX_AGE);
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, Math.max(1, r), 0, Math.PI * 2);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ── Opponents (lerped) ─────────────────────────────────────
     const lerpFactor = 1 - Math.exp(-12 * deltaTime);
     for (const player of allPlayers) {
       if (player.id === playerId) continue;
@@ -107,20 +187,37 @@
       const color = getPlayerColor(player.id);
       ctx.beginPath();
       ctx.arc(px, py, 12, 0, Math.PI * 2);
-      ctx.globalAlpha = 0.6;
+      ctx.globalAlpha = 0.7;
       ctx.fillStyle = color;
       ctx.fill();
       ctx.globalAlpha = 1;
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.stroke();
-      ctx.globalAlpha = 0.8;
+      ctx.globalAlpha = 0.85;
       ctx.fillStyle = '#fff';
       ctx.font = '10px system-ui';
       ctx.textAlign = 'center';
-      ctx.fillText(player.name, px, py - 18);
+      ctx.fillText(player.name, px, py - 16);
       ctx.globalAlpha = 1;
     }
+
+    // Draw hole: dark circle with gold border
+    ctx.beginPath();
+    ctx.arc(maze.hole.x, maze.hole.y, maze.hole.radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fill();
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Draw start position marker
+    ctx.beginPath();
+    ctx.arc(maze.startPosition.x, maze.startPosition.y, 8, 0, Math.PI * 2);
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = '#00ff88';
+    ctx.fill();
+    ctx.globalAlpha = 1;
 
     // Draw local player marble: white with shadow
     if (gameState) {
@@ -184,7 +281,32 @@
     // Bot skips physics — progress is driven by startBotProgressLoop
     if (inputSource !== 'bot') {
       const currentInput = get(input);
-      gameState = updateGame(gameState, defaultMaze, currentInput, deltaTime);
+      // If shortcut is collapsed, inject its gap wall into physics
+      const nowMs = Date.now();
+      const shortcutCollapsed =
+        defaultMaze.shortcut != null &&
+        shortcutState?.collapseUntil != null &&
+        shortcutState.collapseUntil > nowMs;
+      const activeMaze = shortcutCollapsed
+        ? { ...defaultMaze, walls: [...defaultMaze.walls, defaultMaze.shortcut!.gapWall] }
+        : defaultMaze;
+      gameState = updateGame(gameState, activeMaze, currentInput, deltaTime);
+
+      // Shortcut zone entry/exit detection
+      if (defaultMaze.shortcut) {
+        const { x, y } = gameState.ball.position;
+        const { zone } = defaultMaze.shortcut;
+        const nowInZone =
+          x >= zone.x && x <= zone.x + zone.width &&
+          y >= zone.y && y <= zone.y + zone.height;
+        if (nowInZone && !inShortcut && !shortcutCollapsed) {
+          inShortcut = true;
+          enterShortcut(roomId, playerId).catch(console.error);
+        } else if (!nowInZone && inShortcut) {
+          inShortcut = false;
+          exitShortcut(roomId, playerId).catch(console.error);
+        }
+      }
       localGame.set(gameState);
 
       // Sync position + progress to Firebase at ~20fps, skip if barely moved
@@ -263,8 +385,20 @@
     // Also drive any bot players: write their progress+position to Firebase at fixed pace
     const botIntervals: ReturnType<typeof setInterval>[] = [];
     cleanupFns.push(
+      subscribeToShortcut(roomId, (s) => { shortcutState = s; }),
+
       subscribeToPlayers(roomId, (p) => {
         players.set(p);
+        // Append received positions to pheromone trail history
+        const t = Date.now();
+        for (const pl of p) {
+          if (pl.id === playerId || pl.x == null || pl.y == null) continue;
+          const trail = opponentTrails.get(pl.id) ?? [];
+          trail.push({ x: pl.x, y: pl.y, t });
+          if (trail.length > TRAIL_MAX_POINTS) trail.shift();
+          opponentTrails.set(pl.id, trail);
+        }
+
 
         // Start a driver interval for any bot we haven't started yet
         const bots = p.filter((pl) => pl.inputSource === 'bot' && pl.finishedAt == null);
@@ -275,8 +409,8 @@
               const elapsed = Date.now() - startedAt;
               const progress = Math.min(100, (elapsed / 35000) * 100); // ~35s to finish
               const t = progress / 100;
-              const bx = Math.round(maze.startPosition.x + (maze.hole.x - maze.startPosition.x) * t);
-              const by = Math.round(maze.startPosition.y + (maze.hole.y - maze.startPosition.y) * t);
+              const bx = Math.round(defaultMaze.startPosition.x + (defaultMaze.hole.x - defaultMaze.startPosition.x) * t);
+              const by = Math.round(defaultMaze.startPosition.y + (defaultMaze.hole.y - defaultMaze.startPosition.y) * t);
               if (progress >= 100) {
                 clearInterval(id);
                 await finishPlayer(roomId, bot.id, elapsed).catch(console.error);
