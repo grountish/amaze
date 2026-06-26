@@ -278,6 +278,45 @@ export function getLocalWalls(grid: CellGrid, ballX: number, ballY: number): Wal
   return walls;
 }
 
+// Pick a cell suitable for a trap: high pheromone, open, not protected, not too close to others
+export function pickTrapCell(
+  grid: CellGrid,
+  maze: Maze,
+  avoidCells: { col: number; row: number }[],
+): { col: number; row: number } | null {
+  const sc = Math.floor(maze.startPosition.x / CELL_SIZE);
+  const sr = Math.floor(maze.startPosition.y / CELL_SIZE);
+  const hc = Math.floor(maze.hole.x / CELL_SIZE);
+  const hr = Math.floor(maze.hole.y / CELL_SIZE);
+
+  type Candidate = { col: number; row: number; ph: number };
+  const candidates: Candidate[] = [];
+
+  for (let r = 2; r < GRID_ROWS - 2; r++) {
+    for (let c = 2; c < GRID_COLS - 2; c++) {
+      const i = cellIdx(c, r);
+      if (grid.walls[i]) continue;
+      // Keep clear of start and hole
+      if (Math.abs(c - sc) <= 3 && Math.abs(r - sr) <= 3) continue;
+      if (Math.abs(c - hc) <= 3 && Math.abs(r - hr) <= 3) continue;
+      const ph = grid.pheromone[i];
+      if (ph < 0.2) continue;
+      candidates.push({ col: c, row: r, ph });
+    }
+  }
+
+  candidates.sort((a, b) => b.ph - a.ph);
+
+  for (const cand of candidates) {
+    const tooClose = avoidCells.some(
+      (a) => Math.abs(a.col - cand.col) < 3 && Math.abs(a.row - cand.row) < 3,
+    );
+    if (!tooClose) return { col: cand.col, row: cand.row };
+  }
+
+  return null;
+}
+
 // Find open cells with highest pheromone — where nutrients should spawn
 export function findNutrientPositions(grid: CellGrid, count: number): NutrientData[] {
   type Candidate = { col: number; row: number; ph: number };

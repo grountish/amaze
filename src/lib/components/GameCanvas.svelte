@@ -9,12 +9,13 @@
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { startBotProgressLoop } from '$lib/input/botInput';
-  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
-  import type { InputSource, ShortcutState } from '$lib/firebase/types';
-  import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
+  import type { InputSource, ShortcutState, TrapData } from '$lib/firebase/types';
+  import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
   import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
+  import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck } from '$lib/game/botAI';
+  import type { BotGenome, BotPhysicsState, GridPath } from '$lib/game/botAI';
 
   export let roomId: string;
   export let playerId: string;
@@ -60,6 +61,24 @@
   let collectedNutrients = new Set<string>();
   type SpeedBoost = { expires: number; factor: number };
   let speedBoosts: SpeedBoost[] = [];
+
+  // Traps
+  let traps: Record<string, TrapData> = {};
+  let triggeredTraps = new Set<string>();
+
+  // Player death / respawn
+  let deathFlashUntil = 0;
+
+  // Bot AI state (per opponent bot id)
+  type BotAIState = {
+    genome: BotGenome;
+    physics: BotPhysicsState;
+    path: GridPath | null;
+    waypointIdx: number;
+    lastProgress: number;
+    lastProgressTime: number;
+  };
+  const botAIStates = new Map<string, BotAIState>();
   let finishedSynced = false;
   let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
@@ -123,6 +142,24 @@
         ctx.arc(nx, ny, 5 * pulse, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
         ctx.fill();
+        ctx.restore();
+      }
+
+      // ── Traps ─────────────────────────────────────────────────
+      for (const [, trap] of Object.entries(traps)) {
+        const tx = trap.col * CELL_SIZE + CELL_SIZE / 2;
+        const ty = trap.row * CELL_SIZE + CELL_SIZE / 2;
+        const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
+        const sz = 5 * pulse;
+        ctx.save();
+        ctx.shadowColor = '#ff2222';
+        ctx.shadowBlur = 10 * pulse;
+        ctx.strokeStyle = `rgba(255,30,30,${0.8 + 0.2 * pulse})`;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(tx - sz, ty - sz); ctx.lineTo(tx + sz, ty + sz);
+        ctx.moveTo(tx + sz, ty - sz); ctx.lineTo(tx - sz, ty + sz);
+        ctx.stroke();
         ctx.restore();
       }
     } else {
@@ -254,7 +291,12 @@
       ctx.fillStyle = '#fff';
       ctx.font = '10px system-ui';
       ctx.textAlign = 'center';
-      ctx.fillText(player.name, px, py - 16);
+      // Show bot generation (Gen N/deaths) for bot opponents
+      const botState = botAIStates.get(player.id);
+      const label = botState
+        ? `${player.name} Gen${botState.genome.generation}`
+        : player.name;
+      ctx.fillText(label, px, py - 16);
       ctx.globalAlpha = 1;
     }
 
@@ -317,6 +359,25 @@
         ctx.fillStyle = '#44aaff';
         ctx.font = '13px monospace';
         ctx.fillText('MAZE EVOLVING', CANVAS_WIDTH / 2 - 55, CANVAS_HEIGHT - 30);
+        ctx.restore();
+      }
+    }
+
+    // Death flash overlay
+    if (deathFlashUntil > 0) {
+      const remaining = deathFlashUntil - Date.now();
+      if (remaining > 0) {
+        const alpha = remaining / 800;
+        ctx.save();
+        ctx.globalAlpha = alpha * 0.55;
+        ctx.fillStyle = '#ff0000';
+        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 32px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('YOU DIED', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+        ctx.textAlign = 'left';
         ctx.restore();
       }
     }
@@ -387,6 +448,13 @@
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
             const candidates = findNutrientPositions(cellGrid, 3);
             syncNutrients(roomId, candidates).catch(console.error);
+
+            // 30% chance to place a trap on a hot-path cell
+            if (Math.random() < 0.3) {
+              const existingTrapCells = Object.values(traps);
+              const trapCell = pickTrapCell(cellGrid, defaultMaze, existingTrapCells);
+              if (trapCell) addTrap(roomId, trapCell.col, trapCell.row).catch(console.error);
+            }
           }
         }
 
@@ -404,6 +472,31 @@
               if (ok) speedBoosts = [...speedBoosts, { expires: nowMs + 8000, factor: 1 + n.value * 0.2 }];
               else collectedNutrients.delete(id);
             }).catch(console.error);
+          }
+        }
+      }
+
+      // Trap collision for local player (always check, not just when cellGrid ready)
+      if (gameState.status === 'playing') {
+        for (const [id, trap] of Object.entries(traps)) {
+          if (triggeredTraps.has(id)) continue;
+          const tx = (trap.col + 0.5) * CELL_SIZE;
+          const ty = (trap.row + 0.5) * CELL_SIZE;
+          const ddx = gameState.ball.position.x - tx;
+          const ddy = gameState.ball.position.y - ty;
+          if (ddx * ddx + ddy * ddy < 400) {
+            triggeredTraps.add(id);
+            triggerTrap(roomId, id).catch(console.error);
+            deathFlashUntil = nowMs + 800;
+            gameState = {
+              ...gameState,
+              ball: {
+                ...gameState.ball,
+                position: { ...defaultMaze.startPosition },
+                velocity: { x: 0, y: 0 },
+              },
+              progress: 0,
+            };
           }
         }
       }
@@ -481,60 +574,49 @@
     } else if (inputSource === 'motion') {
       cleanupFns.push(startMotionInput());
     } else if (inputSource === 'bot') {
-      cleanupFns.push(
-        startBotProgressLoop((progress) => {
-          if (finishedSynced) return;
+      // Local player is a bot — drive input store from AI
+      const localBotGenome = { ...defaultGenome() };
+      let localBotPath: GridPath | null = null;
+      let localBotWpIdx = 0;
+      let localBotReplansAt = 0;
 
-          gameState = { ...gameState, progress };
-
-          if (progress >= 100) {
-            gameState = {
-              ...gameState,
-              status: 'finished',
-              progress: 100,
-              finishedAt: Date.now(),
-            };
-            finishedSynced = true;
-            localGame.set(gameState);
-            const timeMs = Date.now() - gameStartTime;
-            finishPlayer(roomId, playerId, timeMs).catch(console.error);
-          } else {
-            localGame.set(gameState);
-            const now = performance.now();
-            if (now - lastProgressSync > POSITION_SYNC_THROTTLE) {
-              const { x, y } = gameState.ball.position;
-              const dx = x - lastSyncedPos.x;
-              const dy = y - lastSyncedPos.y;
-              if (dx * dx + dy * dy >= 4) {
-                lastProgressSync = now;
-                lastSyncedPos = { x, y };
-                updatePlayerPosition(roomId, playerId, x, y, progress).catch(console.error);
-              }
-            }
-          }
-        })
-      );
+      const localBotId = setInterval(() => {
+        if (!cellGrid) return;
+        const nowMs = Date.now();
+        const { x, y } = gameState.ball.position;
+        // Re-plan every 2s or when path exhausted
+        if (!localBotPath || nowMs > localBotReplansAt) {
+          localBotPath = bfsPath(cellGrid, x, y, defaultMaze.hole.x, defaultMaze.hole.y);
+          localBotWpIdx = 0;
+          localBotReplansAt = nowMs + 2000;
+        }
+        const { input: botInput, nextWaypointIdx } = computeBotInput(
+          localBotGenome, localBotPath, localBotWpIdx, x, y, cellGrid,
+        );
+        localBotWpIdx = nextWaypointIdx;
+        input.set(botInput);
+      }, 100);
+      cleanupFns.push(() => clearInterval(localBotId));
     }
 
     // Keep players store live during the game (lobby subscription died on unmount)
-    // Also drive any bot players: write their progress+position to Firebase at fixed pace
-    const botIntervals: ReturnType<typeof setInterval>[] = [];
     cleanupFns.push(
       subscribeToShortcut(roomId, (s) => { shortcutState = s; }),
 
       subscribeToMazeGrid(roomId, (b64) => {
         if (b64 && cellGrid) {
           cellGrid.walls = deserializeWalls(b64);
-          // Fade evolved markers after receiving remote update
           cellGrid.evolved.fill(0);
+          for (const s of botAIStates.values()) s.path = null;
         }
       }),
 
       subscribeToNutrients(roomId, (n) => { nutrients = n; }),
 
+      subscribeToTraps(roomId, (t) => { traps = t; }),
+
       subscribeToPlayers(roomId, (p) => {
         players.set(p);
-        // Append received positions to pheromone trail history
         const t = Date.now();
         for (const pl of p) {
           if (pl.id === playerId || pl.x == null || pl.y == null) continue;
@@ -542,33 +624,116 @@
           trail.push({ x: pl.x, y: pl.y, t });
           if (trail.length > TRAIL_MAX_POINTS) trail.shift();
           opponentTrails.set(pl.id, trail);
-        }
 
-
-        // Start a driver interval for any bot we haven't started yet
-        const bots = p.filter((pl) => pl.inputSource === 'bot' && pl.finishedAt == null);
-        if (bots.length > botIntervals.length) {
-          for (const bot of bots.slice(botIntervals.length)) {
-            const startedAt = Date.now();
-            const id = setInterval(async () => {
-              const elapsed = Date.now() - startedAt;
-              const progress = Math.min(100, (elapsed / 35000) * 100); // ~35s to finish
-              const t = progress / 100;
-              const bx = Math.round(defaultMaze.startPosition.x + (defaultMaze.hole.x - defaultMaze.startPosition.x) * t);
-              const by = Math.round(defaultMaze.startPosition.y + (defaultMaze.hole.y - defaultMaze.startPosition.y) * t);
-              if (progress >= 100) {
-                clearInterval(id);
-                await finishPlayer(roomId, bot.id, elapsed).catch(console.error);
-              } else {
-                await updatePlayerPosition(roomId, bot.id, bx, by, progress).catch(console.error);
-              }
-            }, 200);
-            botIntervals.push(id);
+          // Initialise AI state for newly seen bot opponents
+          if (pl.inputSource === 'bot' && !botAIStates.has(pl.id)) {
+            botAIStates.set(pl.id, {
+              genome: defaultGenome(),
+              physics: { x: defaultMaze.startPosition.x, y: defaultMaze.startPosition.y, vx: 0, vy: 0 },
+              path: null,
+              waypointIdx: 0,
+              lastProgress: 0,
+              lastProgressTime: Date.now(),
+            });
           }
         }
       }),
-      () => { for (const id of botIntervals) clearInterval(id); },
     );
+
+    // ── Physics-based bot driver (replaces linear interpolation) ──
+    const botDt = 0.05;
+    const botDriverId = setInterval(async () => {
+      if (!cellGrid) return;
+      const nowMs = Date.now();
+      const allPlayers = get(players);
+      const bots = allPlayers.filter(
+        (pl) => pl.inputSource === 'bot' && pl.id !== playerId && !pl.finishedAt,
+      );
+
+      for (const bot of bots) {
+        let state = botAIStates.get(bot.id);
+        if (!state) continue;
+
+        // Progress towards hole
+        const hx = defaultMaze.hole.x, hy = defaultMaze.hole.y;
+        const sx = defaultMaze.startPosition.x, sy = defaultMaze.startPosition.y;
+        const dpx = state.physics.x - sx, dpy = state.physics.y - sy;
+        const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2);
+        const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
+        const dHx = state.physics.x - hx, dHy = state.physics.y - hy;
+
+        // Reached hole?
+        if (Math.sqrt(dHx * dHx + dHy * dHy) < defaultMaze.hole.radius - 6) {
+          botAIStates.delete(bot.id);
+          await finishPlayer(roomId, bot.id, nowMs - gameStartTime).catch(console.error);
+          continue;
+        }
+
+        // Trap check
+        let hitTrap = false;
+        for (const [trapId, trap] of Object.entries(traps)) {
+          const tx = (trap.col + 0.5) * CELL_SIZE, ty = (trap.row + 0.5) * CELL_SIZE;
+          const ddx = state.physics.x - tx, ddy = state.physics.y - ty;
+          if (ddx * ddx + ddy * ddy < 400) {
+            triggerTrap(roomId, trapId).catch(console.error);
+            const newGenome = mutate(state.genome, progress);
+            state = {
+              genome: newGenome,
+              physics: { x: sx, y: sy, vx: 0, vy: 0 },
+              path: null,
+              waypointIdx: 0,
+              lastProgress: 0,
+              lastProgressTime: nowMs,
+            };
+            botAIStates.set(bot.id, state);
+            hitTrap = true;
+            break;
+          }
+        }
+        if (hitTrap) continue;
+
+        // Stuck check
+        if (progress > state.lastProgress + 2) {
+          state.lastProgress = progress;
+          state.lastProgressTime = nowMs;
+        }
+        if (isStuck(progress, state.lastProgressTime, state.genome, nowMs)) {
+          const newGenome = mutate(state.genome, progress);
+          state = {
+            genome: newGenome,
+            physics: { x: sx, y: sy, vx: 0, vy: 0 },
+            path: null,
+            waypointIdx: 0,
+            lastProgress: 0,
+            lastProgressTime: nowMs,
+          };
+          botAIStates.set(bot.id, state);
+          continue;
+        }
+
+        // Re-plan path if needed
+        if (!state.path) {
+          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, hx, hy);
+          state.waypointIdx = 0;
+        }
+
+        // Compute input from genome + path + pheromone
+        const { input: botInput, nextWaypointIdx } = computeBotInput(
+          state.genome, state.path, state.waypointIdx, state.physics.x, state.physics.y, cellGrid,
+        );
+        state.waypointIdx = nextWaypointIdx;
+
+        // Step physics
+        state.physics = stepBotPhysics(state.physics, botInput.x, botInput.y, cellGrid, botDt);
+
+        // Bot deposits pheromone
+        depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.05);
+
+        await updatePlayerPosition(roomId, bot.id, state.physics.x, state.physics.y, progress).catch(console.error);
+        botAIStates.set(bot.id, state);
+      }
+    }, 50);
+    cleanupFns.push(() => clearInterval(botDriverId));
 
     lastFrameTime = performance.now();
     animFrameId = requestAnimationFrame(gameLoop);

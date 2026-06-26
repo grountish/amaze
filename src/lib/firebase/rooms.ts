@@ -287,3 +287,32 @@ export function subscribeToNutrients(
 ): () => void {
   return onValue(ref(db(), `rooms/${roomId}/nutrients`), (snap) => callback(snap.val() ?? {}));
 }
+
+// ── Traps ──────────────────────────────────────────────────────
+
+import type { TrapData } from './types';
+
+export async function addTrap(roomId: string, col: number, row: number): Promise<void> {
+  const trapsRef = ref(db(), `rooms/${roomId}/traps`);
+  const snap = await get(trapsRef);
+  const existing: Record<string, TrapData> = snap.val() ?? {};
+  if (Object.keys(existing).length >= 5) return; // cap at 5
+  await update(trapsRef, { [`t_${Date.now()}`]: { col, row } });
+}
+
+export async function triggerTrap(roomId: string, trapId: string): Promise<boolean> {
+  let triggered = false;
+  await runTransaction(ref(db(), `rooms/${roomId}/traps/${trapId}`), (current) => {
+    if (current == null) return undefined;
+    triggered = true;
+    return null; // one-shot: remove after triggering
+  });
+  return triggered;
+}
+
+export function subscribeToTraps(
+  roomId: string,
+  callback: (traps: Record<string, TrapData>) => void,
+): () => void {
+  return onValue(ref(db(), `rooms/${roomId}/traps`), (snap) => callback(snap.val() ?? {}));
+}

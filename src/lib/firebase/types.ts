@@ -7,6 +7,11 @@ export type ShortcutState = {
   collapseUntil: number | null;
 };
 
+export type TrapData = {
+  col: number;
+  row: number;
+};
+
 export type Room = {
   id: string;
   status: RoomStatus;
