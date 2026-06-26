@@ -3,7 +3,7 @@ import type { Maze, Wall, Vector2 } from './types';
 export const GRID_COLS = 40;
 export const GRID_ROWS = 30;
 export const CELL_SIZE = 20;
-export const EVOLUTION_INTERVAL = 4000; // ms between evolution ticks
+export const EVOLUTION_INTERVAL = 3000; // ms between evolution ticks
 
 export type CellGrid = {
   walls: Uint8Array;       // 1=wall 0=open
@@ -58,7 +58,7 @@ export function initGridFromMaze(grid: CellGrid, maze: Maze): void {
     grid.hardness[cellIdx(GRID_COLS - 1, r)] = 255;
   }
 
-  // Paint maze walls into grid cells
+  // Paint maze walls into grid cells (skip border cells — they keep hardness 255)
   for (const wall of maze.walls) {
     const c0 = Math.floor(wall.x / CELL_SIZE);
     const r0 = Math.floor(wall.y / CELL_SIZE);
@@ -66,9 +66,11 @@ export function initGridFromMaze(grid: CellGrid, maze: Maze): void {
     const r1 = Math.ceil((wall.y + wall.height) / CELL_SIZE);
     for (let r = r0; r < r1; r++) {
       for (let c = c0; c < c1; c++) {
-        if (c <= 0 || c >= GRID_COLS - 1 || r <= 0 || r >= GRID_ROWS - 1) continue;
-        grid.walls[cellIdx(c, r)] = 1;
-        grid.hardness[cellIdx(c, r)] = 2;
+        if (c < 0 || c >= GRID_COLS || r < 0 || r >= GRID_ROWS) continue;
+        const i = cellIdx(c, r);
+        if (grid.hardness[i] === 255) continue; // border cells: never touch
+        grid.walls[i] = 1;
+        grid.hardness[i] = 1; // start at 1 — erodes after 2 ticks (~6s)
       }
     }
   }
@@ -113,14 +115,14 @@ export function depositPheromone(
   grid: CellGrid,
   x: number,
   y: number,
-  amount = 0.07,
+  amount = 0.12,
 ): void {
   const { col, row } = posToCell(x, y);
   for (let dr = -1; dr <= 1; dr++) {
     for (let dc = -1; dc <= 1; dc++) {
       const c = col + dc, r = row + dr;
       if (c < 0 || c >= GRID_COLS || r < 0 || r >= GRID_ROWS) continue;
-      const w = dc === 0 && dr === 0 ? 1.0 : 0.25;
+      const w = dc === 0 && dr === 0 ? 1.0 : 0.4;
       const i = cellIdx(c, r);
       grid.pheromone[i] = Math.min(1, grid.pheromone[i] + amount * w);
     }
@@ -204,8 +206,8 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
       const isWall = grid.walls[i] === 1;
 
       if (isWall) {
-        // Erosion: heavy traffic wears down hardness then opens the cell
-        if (ph > 0.35) {
+        // Erosion: sustained traffic wears down hardness then opens the cell
+        if (ph > 0.2) {
           if (hard > 0) {
             grid.hardness[i] = hard - 1;
           } else {
@@ -214,11 +216,11 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
           }
         }
       } else {
-        // Overgrowth: neglected open cells regrow as walls
-        if (ph < 0.015) {
+        // Overgrowth: deeply neglected open cells slowly regrow
+        if (ph < 0.008) {
           const openN = countOpenNeighbors(grid.walls, c, r);
-          // Only grow if surrounded by enough open space (avoids sealing tunnels)
-          if (openN >= 5 && Math.random() < 0.1) {
+          // Only grow in very open areas, slowly (avoid blocking tunnels)
+          if (openN >= 7 && Math.random() < 0.06) {
             newWalls[i] = 1;
             grid.hardness[i] = 1;
             grid.evolved[i] = -1;

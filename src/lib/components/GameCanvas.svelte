@@ -110,9 +110,12 @@
         for (let c = 0; c < GRID_COLS; c++) {
           const i = r * GRID_COLS + c;
           const ph = cellGrid.pheromone[i];
-          if (ph < 0.04) continue;
-          ctx.globalAlpha = Math.min(0.55, ph * 0.7);
-          ctx.fillStyle = `hsl(${30 + ph * 20}, 100%, 60%)`;
+          if (ph < 0.02) continue;
+          ctx.globalAlpha = Math.min(0.75, ph);
+          // Amber → yellow → white as pheromone increases
+          const hue = 35 - ph * 15;
+          const light = 45 + ph * 25;
+          ctx.fillStyle = `hsl(${hue}, 100%, ${light}%)`;
           ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
         }
       }
@@ -443,7 +446,9 @@
         if (nowMs - lastEvolutionTick > EVOLUTION_INTERVAL) {
           lastEvolutionTick = nowMs;
           const sortedOnline = get(players).filter((p) => p.online).sort((a, b) => a.id.localeCompare(b.id));
-          if (sortedOnline[0]?.id === playerId) {
+          // Fallback to self if no players loaded yet (Firebase async startup)
+          const amHost = sortedOnline.length === 0 || sortedOnline[0].id === playerId;
+          if (amHost) {
             evolveGrid(cellGrid, defaultMaze);
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
             const candidates = findNutrientPositions(cellGrid, 3);
@@ -606,8 +611,9 @@
       subscribeToMazeGrid(roomId, (b64) => {
         if (b64 && cellGrid) {
           cellGrid.walls = deserializeWalls(b64);
-          cellGrid.evolved.fill(0);
           for (const s of botAIStates.values()) s.path = null;
+          // Delay clearing evolved markers so flash is visible for ~1s
+          setTimeout(() => { if (cellGrid) cellGrid.evolved.fill(0); }, 900);
         }
       }),
 
@@ -619,14 +625,8 @@
         players.set(p);
         const t = Date.now();
         for (const pl of p) {
-          if (pl.id === playerId || pl.x == null || pl.y == null) continue;
-          const trail = opponentTrails.get(pl.id) ?? [];
-          trail.push({ x: pl.x, y: pl.y, t });
-          if (trail.length > TRAIL_MAX_POINTS) trail.shift();
-          opponentTrails.set(pl.id, trail);
-
-          // Initialise AI state for newly seen bot opponents
-          if (pl.inputSource === 'bot' && !botAIStates.has(pl.id)) {
+          // Init bot AI state as soon as we see a bot — before position check
+          if (pl.inputSource === 'bot' && pl.id !== playerId && !botAIStates.has(pl.id)) {
             botAIStates.set(pl.id, {
               genome: defaultGenome(),
               physics: { x: defaultMaze.startPosition.x, y: defaultMaze.startPosition.y, vx: 0, vy: 0 },
@@ -636,6 +636,12 @@
               lastProgressTime: Date.now(),
             });
           }
+
+          if (pl.id === playerId || pl.x == null || pl.y == null) continue;
+          const trail = opponentTrails.get(pl.id) ?? [];
+          trail.push({ x: pl.x, y: pl.y, t });
+          if (trail.length > TRAIL_MAX_POINTS) trail.shift();
+          opponentTrails.set(pl.id, trail);
         }
       }),
     );
