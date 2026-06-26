@@ -282,7 +282,7 @@
 
       const color = getPlayerColor(player.id);
       ctx.beginPath();
-      ctx.arc(px, py, 12, 0, Math.PI * 2);
+      ctx.arc(px, py, 9, 0, Math.PI * 2);
       ctx.globalAlpha = 0.7;
       ctx.fillStyle = color;
       ctx.fill();

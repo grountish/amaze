@@ -5,7 +5,7 @@ export function createInitialGameState(maze: Maze): LocalGameState {
     ball: {
       position: { ...maze.startPosition },
       velocity: { x: 0, y: 0 },
-      radius: 12,
+      radius: 9,
     },
     status: "idle",
     progress: 0,
