@@ -3,7 +3,7 @@ import type { Maze, Wall, Vector2 } from './types';
 export const GRID_COLS = 40;
 export const GRID_ROWS = 30;
 export const CELL_SIZE = 20;
-export const EVOLUTION_INTERVAL = 3000; // ms between evolution ticks
+export const EVOLUTION_INTERVAL = 1500; // ms between evolution ticks
 
 export type CellGrid = {
   walls: Uint8Array;       // 1=wall 0=open
@@ -115,7 +115,7 @@ export function depositPheromone(
   grid: CellGrid,
   x: number,
   y: number,
-  amount = 0.12,
+  amount = 0.2,
 ): void {
   const { col, row } = posToCell(x, y);
   for (let dr = -1; dr <= 1; dr++) {
@@ -130,8 +130,9 @@ export function depositPheromone(
 }
 
 export function decayPheromone(grid: CellGrid, dt: number): void {
-  // Half-life ~6s
-  const factor = Math.pow(0.89, dt);
+  // Half-life ~11s — trails linger long enough to accumulate past the
+  // erosion threshold, so corridors actually wear open as players travel.
+  const factor = Math.pow(0.94, dt);
   for (let i = 0; i < grid.pheromone.length; i++) {
     grid.pheromone[i] *= factor;
   }
@@ -206,8 +207,9 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
       const isWall = grid.walls[i] === 1;
 
       if (isWall) {
-        // Erosion: sustained traffic wears down hardness then opens the cell
-        if (ph > 0.2) {
+        // Erosion: traffic wears down hardness then opens the cell. Lower
+        // threshold so corridors players actually use wear open into shortcuts.
+        if (ph > 0.1) {
           if (hard > 0) {
             grid.hardness[i] = hard - 1;
           } else {
@@ -216,11 +218,11 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
           }
         }
       } else {
-        // Overgrowth: deeply neglected open cells slowly regrow
-        if (ph < 0.008) {
+        // Overgrowth: neglected open cells regrow walls, so abandoned routes
+        // close back up and the maze keeps reshaping (not just opening).
+        if (ph < 0.03) {
           const openN = countOpenNeighbors(grid.walls, c, r);
-          // Only grow in very open areas, slowly (avoid blocking tunnels)
-          if (openN >= 7 && Math.random() < 0.06) {
+          if (openN >= 6 && Math.random() < 0.14) {
             newWalls[i] = 1;
             grid.hardness[i] = 1;
             grid.evolved[i] = -1;
@@ -302,7 +304,7 @@ export function pickTrapCell(
       if (Math.abs(c - sc) <= 3 && Math.abs(r - sr) <= 3) continue;
       if (Math.abs(c - hc) <= 3 && Math.abs(r - hr) <= 3) continue;
       const ph = grid.pheromone[i];
-      if (ph < 0.2) continue;
+      if (ph < 0.1) continue;
       candidates.push({ col: c, row: r, ph });
     }
   }

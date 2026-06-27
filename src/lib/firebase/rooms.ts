@@ -63,6 +63,19 @@ export async function deleteRoom(roomId: string): Promise<void> {
   await remove(ref(db(), `rooms/${roomId}`));
 }
 
+// "Restart for all": wipe the whole room — every player, bot, trap, nutrient
+// and the evolved maze — and recreate a fresh waiting lobby with a new maze.
+// The caller re-joins afterwards; other clients should re-enter/reload.
+export async function resetRoom(roomId: string): Promise<void> {
+  await set(ref(db(), `rooms/${roomId}`), {
+    id: roomId,
+    status: "waiting",
+    mazeId: String(randomSeed()),
+    createdAt: Date.now(),
+    lap: 0,
+  } satisfies Room);
+}
+
 // Shortcut gate — atomic transaction returns: 'claimed' | 'collapsed' | 'blocked'
 export async function enterShortcut(
   roomId: string,
@@ -122,7 +135,7 @@ export async function joinRoom(roomId: string, playerName: string, inputSource: 
   const user = getCurrentUser();
   if (!user) throw new Error("Not authenticated");
 
-  // Sweep ghosts from prior sessions before joining the shared room.
+  // Sweep ghosts (and idle bots) left by prior sessions before joining.
   await pruneStalePlayers(roomId);
 
   const now = Date.now();
@@ -186,6 +199,22 @@ export async function pruneStalePlayers(roomId: string): Promise<void> {
   const updates: Record<string, null> = {};
   for (const [id, p] of Object.entries(data)) {
     if (!isFresh(p, now)) updates[id] = null;
+  }
+  if (Object.keys(updates).length > 0) await update(playersRef, updates);
+}
+
+// Bots are session-scoped: the in-game driver keeps writing their lastSeenAt
+// so the staleness sweep can't catch them, and they pile up across add-bot /
+// refresh cycles. Wipe all bots — called when joining a lobby that isn't
+// mid-game, so each lobby starts with zero bots and you add the ones you want.
+export async function removeBots(roomId: string): Promise<void> {
+  const playersRef = ref(db(), `rooms/${roomId}/players`);
+  const snap = await get(playersRef);
+  if (!snap.exists()) return;
+  const data = snap.val() as Record<string, Player>;
+  const updates: Record<string, null> = {};
+  for (const [id, p] of Object.entries(data)) {
+    if (p.inputSource === "bot") updates[id] = null;
   }
   if (Object.keys(updates).length > 0) await update(playersRef, updates);
 }
@@ -371,7 +400,7 @@ export async function addTrap(roomId: string, col: number, row: number): Promise
   const trapsRef = ref(db(), `rooms/${roomId}/traps`);
   const snap = await get(trapsRef);
   const existing: Record<string, TrapData> = snap.val() ?? {};
-  if (Object.keys(existing).length >= 5) return; // cap at 5
+  if (Object.keys(existing).length >= 8) return; // cap at 8
   await update(trapsRef, { [`t_${Date.now()}`]: { col, row } });
 }
 
