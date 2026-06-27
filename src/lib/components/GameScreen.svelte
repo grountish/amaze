@@ -4,7 +4,7 @@
   import Leaderboard from './Leaderboard.svelte';
   import SensorDebugPanel from './SensorDebugPanel.svelte';
   import MotionPermissionButton from './MotionPermissionButton.svelte';
-  import { currentPlayerId } from '$lib/stores/playerStore';
+  import { currentPlayerId, players } from '$lib/stores/playerStore';
   import { debugMode } from '$lib/stores/gameStore';
   import { room } from '$lib/stores/roomStore';
   import { subscribeToRoom, deleteRoom } from '$lib/firebase/rooms';
@@ -28,6 +28,15 @@
   let unsubPlayerId: (() => void) | null = null;
 
   $: showDebug = $debugMode || hasDebugParam;
+  // Live lap scoreboard (endless morph)
+  $: scores = [...$players]
+    .filter((p) => p.online)
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  async function exitGame() {
+    await deleteRoom(roomId);
+    dispatch('home');
+  }
 
   function startTimer(startedAt: number) {
     if (timerInterval) return;
@@ -96,6 +105,20 @@
       {elapsedSeconds}s
     </div>
   {/if}
+
+  {#if playerId && scores.length > 0}
+    <div class="scoreboard">
+      <div class="sb-title">Laps</div>
+      {#each scores as p (p.id)}
+        <div class="sb-row" class:me={p.id === playerId}>
+          <span class="sb-name">{p.name}</span>
+          <span class="sb-score">{p.score ?? 0}</span>
+        </div>
+      {/each}
+    </div>
+  {/if}
+
+  <button class="exit-btn" on:click={exitGame}>Exit</button>
 </div>
 
 <style>
@@ -109,6 +132,51 @@
     align-items: center;
     justify-content: center;
   }
+
+  .scoreboard {
+    position: absolute;
+    top: 0.75rem;
+    right: 0.75rem;
+    background: rgba(20, 20, 40, 0.82);
+    border: 1px solid #3a3a6a;
+    border-radius: 8px;
+    padding: 0.4rem 0.6rem;
+    min-width: 110px;
+    color: #e8e8ff;
+    font-size: 0.8rem;
+    z-index: 20;
+  }
+  .sb-title {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8888aa;
+    margin-bottom: 0.25rem;
+  }
+  .sb-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.1rem 0;
+  }
+  .sb-row.me .sb-name { color: #6ad06a; font-weight: 600; }
+  .sb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
+  .sb-score { font-variant-numeric: tabular-nums; font-weight: 700; }
+
+  .exit-btn {
+    position: absolute;
+    top: 0.75rem;
+    left: 0.75rem;
+    background: rgba(40, 20, 20, 0.82);
+    border: 1px solid #6a3a3a;
+    color: #ffd0d0;
+    border-radius: 8px;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    z-index: 20;
+  }
+  .exit-btn:hover { background: rgba(80, 30, 30, 0.9); }
 
   .permission-overlay {
     display: flex;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from "svelte";
-  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, addBotPlayer, setRoomStatus } from "$lib/firebase/rooms";
+  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, addBotPlayer, startGame } from "$lib/firebase/rooms";
   import { setupPresence } from "$lib/firebase/presence";
   import { players, currentPlayerId } from "$lib/stores/playerStore";
   import { room } from "$lib/stores/roomStore";
@@ -12,18 +12,23 @@
 
   const dispatch = createEventDispatcher();
 
-  let countdown = 0;
-  let countdownTimer: ReturnType<typeof setInterval> | null = null;
   let unsubRoom: (() => void) | null = null;
   let unsubPlayers: (() => void) | null = null;
   let cleanupPresence: (() => void) | null = null;
   let gameStarted = false;
   let isReady = false;
+  let botCount = 1;
+  let addingBots = false;
 
   $: myId = $currentPlayerId;
   $: me = $players.find((p) => p.id === myId);
-  $: allReady = $players.length >= 2 && $players.every((p) => p.ready);
   $: isHost = $players.length > 0 && $players[0].id === myId;
+  // Startable = a room exists that isn't already running or done. Guarding on
+  // "not playing/finished" (instead of exactly "waiting") also recovers a
+  // shared room left stuck in a stale status by a previous session.
+  $: startable = !!$room && $room.status !== "playing" && $room.status !== "finished";
+  // Auto-start only in multiplayer: everyone present has readied up.
+  $: allReady = $players.length >= 2 && $players.every((p) => p.ready);
 
   async function toggleReady() {
     if (!myId) return;
@@ -31,27 +36,24 @@
     await setPlayerReady(roomId, myId, isReady);
   }
 
-  async function handleAddBot() {
-    await addBotPlayer(roomId);
+  async function handleAddBots() {
+    const n = Math.max(1, Math.min(50, Math.floor(botCount) || 1));
+    addingBots = true;
+    try {
+      for (let i = 0; i < n; i++) await addBotPlayer(roomId);
+    } finally {
+      addingBots = false;
+    }
   }
 
-  function startCountdown() {
-    countdown = 3;
-    countdownTimer = setInterval(async () => {
-      countdown--;
-      if (countdown <= 0) {
-        if (countdownTimer) clearInterval(countdownTimer);
-        await setRoomStatus(roomId, "playing");
-      }
-    }, 1000);
+  // No countdown — multiplayer auto-starts once everyone is ready.
+  $: if (allReady && myId && startable) {
+    startGame(roomId);
   }
 
-  $: if (allReady && myId && $room?.status === "waiting" && !countdownTimer) {
-    setRoomStatus(roomId, "countdown");
-  }
-
-  $: if ($room?.status === "countdown" && !countdownTimer) {
-    startCountdown();
+  // Host can force-start at any time (e.g. solo, or before laggards ready up).
+  function handleStartNow() {
+    if (myId && startable) startGame(roomId);
   }
 
   $: if ($room?.status === "playing" && !gameStarted) {
@@ -69,8 +71,11 @@
     unsubRoom?.();
     unsubPlayers?.();
     cleanupPresence?.();
-    if (countdownTimer) clearInterval(countdownTimer);
   });
+
+  // Humans listed individually; bots collapsed into a single anonymous count.
+  $: humans = $players.filter((p) => p.inputSource !== "bot");
+  $: botList = $players.filter((p) => p.inputSource === "bot");
 </script>
 
 <div class="lobby">
@@ -79,14 +84,10 @@
     <span class="code">{roomId}</span>
   </div>
 
-  {#if $room?.status === "countdown"}
-    <div class="countdown">{countdown}</div>
-  {/if}
-
   <div class="players-section">
     <h2>Players ({$players.length})</h2>
     <ul class="player-list">
-      {#each $players as player (player.id)}
+      {#each humans as player (player.id)}
         <li class="player-item" class:offline={!player.online}>
           <span class="player-name">
             {player.name}
@@ -98,6 +99,13 @@
           </span>
         </li>
       {/each}
+      {#if botList.length > 0}
+        <li class="player-item">
+          <span class="player-name">Bots ×{botList.length}</span>
+          <span class="player-meta">bot</span>
+          <span class="ready-badge ready">READY</span>
+        </li>
+      {/if}
     </ul>
   </div>
 
@@ -105,15 +113,31 @@
     <button class="btn-ready" class:active={isReady} on:click={toggleReady}>
       {isReady ? "Not Ready" : "Ready Up"}
     </button>
-    <button class="btn-bot" on:click={handleAddBot}>Add Bot</button>
+    <div class="bot-add">
+      <input
+        class="bot-count"
+        type="number"
+        min="1"
+        max="50"
+        bind:value={botCount}
+        aria-label="Number of bots"
+      />
+      <button class="btn-bot" on:click={handleAddBots} disabled={addingBots}>
+        {addingBots ? "Adding…" : "Add Bots"}
+      </button>
+    </div>
   </div>
 
-  {#if allReady && $room?.status === "waiting"}
-    <p class="status-msg">All ready! Starting countdown...</p>
-  {:else if $players.length < 2}
-    <p class="status-msg">Waiting for more players...</p>
-  {:else}
-    <p class="status-msg">Waiting for all players to ready up...</p>
+  {#if isHost}
+    <button class="btn-start" on:click={handleStartNow} disabled={!startable}>
+      Start Game
+    </button>
+  {/if}
+
+  {#if !isHost && $players.length < 2}
+    <p class="status-msg">Waiting for the host to start...</p>
+  {:else if !allReady}
+    <p class="status-msg">Ready up — host can start any time.</p>
   {/if}
 </div>
 
@@ -150,19 +174,6 @@
     letter-spacing: 0.3em;
     color: #a0a0ff;
     font-family: monospace;
-  }
-
-  .countdown {
-    font-size: 6rem;
-    font-weight: 900;
-    text-align: center;
-    color: #ffcc44;
-    animation: pulse 0.5s ease-in-out infinite alternate;
-  }
-
-  @keyframes pulse {
-    from { transform: scale(1); }
-    to { transform: scale(1.1); }
   }
 
   h2 {
@@ -261,6 +272,49 @@
 
   .btn-bot:hover {
     background: #1e1e3a;
+  }
+
+  .btn-bot:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .bot-add {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+
+  .bot-count {
+    width: 4rem;
+    padding: 0.5rem;
+    border: 1px solid #3a3a6a;
+    border-radius: 10px;
+    background: #14142a;
+    color: #e8e8ff;
+    font-size: 0.875rem;
+    text-align: center;
+  }
+
+  .btn-start {
+    width: 100%;
+    padding: 0.95rem;
+    border: none;
+    border-radius: 10px;
+    font-size: 1.05rem;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    background: #1a6a3a;
+    color: #fff;
+  }
+
+  .btn-start:hover:not(:disabled) {
+    background: #228a4a;
+  }
+
+  .btn-start:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
 
   .status-msg {

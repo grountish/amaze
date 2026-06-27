@@ -34,7 +34,8 @@
     screen = "home";
     roomId = "";
     playerName = "";
-    inputSource = "joystick";
+    const isMobile = navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse)").matches;
+    inputSource = isMobile ? "joystick" : "keyboard";
   }
 </script>
 
