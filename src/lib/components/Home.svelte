@@ -8,7 +8,7 @@
   const dispatch = createEventDispatcher();
 
   let playerName = "";
-  let inputSource: InputSource = "joystick";
+  let inputSource: InputSource = "keyboard";
   let error = "";
   let loading = false;
 
@@ -16,6 +16,8 @@
     initAuth();
     const saved = localStorage.getItem("playerName");
     if (saved) playerName = saved;
+    const isMobile = navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse)").matches;
+    inputSource = isMobile ? "joystick" : "keyboard";
   });
 
   async function handlePlay() {

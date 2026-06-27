@@ -84,9 +84,17 @@ function resolveWallCollisions(state: LocalGameState, maze: Maze): LocalGameStat
 
     if (distance < radius) {
       const safe = distance || 1;
+      const nx = dx / safe, ny = dy / safe;
       const overlap = radius - safe;
-      position = { x: position.x + (dx / safe) * overlap, y: position.y + (dy / safe) * overlap };
-      velocity = { x: velocity.x * -0.35, y: velocity.y * -0.35 };
+      // Push out of the wall...
+      position = { x: position.x + nx * overlap, y: position.y + ny * overlap };
+      // ...and remove only the velocity component pushing INTO the wall, keeping
+      // the tangential part so the ball SLIDES along walls instead of bouncing
+      // back / stalling. No speed penalty for grazing a wall.
+      const vn = velocity.x * nx + velocity.y * ny;
+      if (vn < 0) {
+        velocity = { x: velocity.x - vn * nx, y: velocity.y - vn * ny };
+      }
     }
   }
 

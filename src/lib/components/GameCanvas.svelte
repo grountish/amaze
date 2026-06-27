@@ -5,16 +5,17 @@
   import { localGame, debugMode } from '$lib/stores/gameStore';
   import { players, currentPlayerId } from '$lib/stores/playerStore';
   import { defaultMaze } from '$lib/game/maze';
+  import { generateMaze, seedFromMazeId, DEFAULT_SEED } from '$lib/game/mazeGen';
   import { createInitialGameState, updateGame } from '$lib/game/engine';
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { updatePlayerPosition, finishPlayer, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, winLap, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState, TrapData } from '$lib/firebase/types';
   import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
   import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
-  import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck } from '$lib/game/botAI';
+  import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround } from '$lib/game/botAI';
   import type { BotGenome, BotPhysicsState, GridPath } from '$lib/game/botAI';
 
   export let roomId: string;
@@ -32,6 +33,13 @@
 
   let canvas: HTMLCanvasElement;
   let gameState: LocalGameState;
+  // Active procedural maze (changes each lap in endless morph)
+  let activeMaze: Maze = defaultMaze;
+  let currentSeed = DEFAULT_SEED;
+  let currentLap = 0;
+  let lapWinSent = false; // guard: one winLap call per lap
+  let lapFlash = ''; // transient winner banner
+  let lapFlashTimer: ReturnType<typeof setTimeout> | null = null;
   let animFrameId: number;
   let cleanupFns: Array<() => void> = [];
   let lastProgressSync: number = 0;
@@ -77,9 +85,11 @@
     waypointIdx: number;
     lastProgress: number;
     lastProgressTime: number;
+    hazard: Float32Array; // learned death map, carried across resets
+    known: Uint8Array;    // fog-of-war discovered cells, carried across resets
+    replanAt: number;     // next time this bot may recompute its path
   };
   const botAIStates = new Map<string, BotAIState>();
-  let finishedSynced = false;
   let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
 
@@ -96,7 +106,7 @@
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const maze = defaultMaze;
+    const maze = activeMaze;
 
     // Clear with dark background
     ctx.fillStyle = '#06060f';
@@ -168,7 +178,7 @@
     } else {
       // Fallback: static walls while grid initialises
       ctx.fillStyle = '#2e2e50';
-      for (const wall of defaultMaze.walls) {
+      for (const wall of activeMaze.walls) {
         ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
       }
     }
@@ -290,17 +300,15 @@
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.stroke();
-      ctx.globalAlpha = 0.85;
-      ctx.fillStyle = '#fff';
-      ctx.font = '10px system-ui';
-      ctx.textAlign = 'center';
-      // Show bot generation (Gen N/deaths) for bot opponents
-      const botState = botAIStates.get(player.id);
-      const label = botState
-        ? `${player.name} Gen${botState.genome.generation}`
-        : player.name;
-      ctx.fillText(label, px, py - 16);
-      ctx.globalAlpha = 1;
+      // Label human opponents only — bots are anonymous (no name/gen text)
+      if (player.inputSource !== 'bot') {
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText(player.name, px, py - 16);
+        ctx.globalAlpha = 1;
+      }
     }
 
     // Draw hole: dark circle with gold border
@@ -449,7 +457,7 @@
           // Fallback to self if no players loaded yet (Firebase async startup)
           const amHost = sortedOnline.length === 0 || sortedOnline[0].id === playerId;
           if (amHost) {
-            evolveGrid(cellGrid, defaultMaze);
+            evolveGrid(cellGrid, activeMaze);
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
             const candidates = findNutrientPositions(cellGrid, 3);
             syncNutrients(roomId, candidates).catch(console.error);
@@ -457,7 +465,7 @@
             // 30% chance to place a trap on a hot-path cell
             if (Math.random() < 0.3) {
               const existingTrapCells = Object.values(traps);
-              const trapCell = pickTrapCell(cellGrid, defaultMaze, existingTrapCells);
+              const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells);
               if (trapCell) addTrap(roomId, trapCell.col, trapCell.row).catch(console.error);
             }
           }
@@ -497,7 +505,7 @@
               ...gameState,
               ball: {
                 ...gameState.ball,
-                position: { ...defaultMaze.startPosition },
+                position: { ...activeMaze.startPosition },
                 velocity: { x: 0, y: 0 },
               },
               progress: 0,
@@ -508,22 +516,22 @@
 
       // Build physics walls from grid + optional shortcut collapse
       const shortcutCollapsed =
-        defaultMaze.shortcut != null &&
+        activeMaze.shortcut != null &&
         shortcutState?.collapseUntil != null &&
         shortcutState.collapseUntil > nowMs;
       const localWalls = cellGrid
         ? getLocalWalls(cellGrid, gameState.ball.position.x, gameState.ball.position.y)
-        : defaultMaze.walls;
-      if (shortcutCollapsed && defaultMaze.shortcut) {
-        localWalls.push(defaultMaze.shortcut.gapWall);
+        : activeMaze.walls;
+      if (shortcutCollapsed && activeMaze.shortcut) {
+        localWalls.push(activeMaze.shortcut.gapWall);
       }
-      const activeMaze = { ...defaultMaze, walls: localWalls };
-      gameState = updateGame(gameState, activeMaze, currentInput, deltaTime, speedFactor);
+      const frameMaze = { ...activeMaze, walls: localWalls };
+      gameState = updateGame(gameState, frameMaze, currentInput, deltaTime, speedFactor);
 
       // Shortcut zone entry/exit detection
-      if (defaultMaze.shortcut) {
+      if (activeMaze.shortcut) {
         const { x, y } = gameState.ball.position;
-        const { zone } = defaultMaze.shortcut;
+        const { zone } = activeMaze.shortcut;
         const nowInZone =
           x >= zone.x && x <= zone.x + zone.width &&
           y >= zone.y && y <= zone.y + zone.height;
@@ -550,11 +558,15 @@
         }
       }
 
-      // Handle finish (once)
-      if (gameState.status === 'finished' && !finishedSynced) {
-        finishedSynced = true;
-        const timeMs = Date.now() - gameStartTime;
-        finishPlayer(roomId, playerId, timeMs).catch(console.error);
+      // Reached the hole → win this lap (endless morph). The maze regenerates
+      // for everyone via the room's seed; we keep playing until the broadcast
+      // resets positions. lapWinSent guards one win per lap.
+      if (gameState.status === 'finished' && !lapWinSent) {
+        lapWinSent = true;
+        winLap(roomId, playerId, currentLap, Date.now()).catch(console.error);
+        // Unfreeze locally so the ball isn't stuck "finished" before the reset
+        gameState = { ...gameState, status: 'playing' };
+        localGame.set(gameState);
       }
     }
 
@@ -563,16 +575,49 @@
     animFrameId = requestAnimationFrame(gameLoop);
   }
 
+  // Endless morph: rebuild the maze + reset everyone to start. Driven by the
+  // room's shared seed so every client generates an identical new maze.
+  function applyMaze(seed: number) {
+    activeMaze = generateMaze(seed);
+    currentSeed = seed;
+    if (!cellGrid) cellGrid = createCellGrid();
+    initGridFromMaze(cellGrid, activeMaze);
+    if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
+    cellGrid.pheromone.fill(0);
+    cellGrid.evolved.fill(0);
+    // Reset local ball to start
+    if (gameState) {
+      gameState = {
+        ...gameState,
+        ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
+        status: 'playing',
+      };
+      localGame.set(gameState);
+    }
+    // Reset all bots to start; new maze ⇒ fresh hazard map (old deaths are stale)
+    for (const st of botAIStates.values()) {
+      st.physics = { x: activeMaze.startPosition.x, y: activeMaze.startPosition.y, vx: 0, vy: 0 };
+      st.path = null;
+      st.waypointIdx = 0;
+      st.lastProgress = 0;
+      st.lastProgressTime = Date.now();
+      st.hazard = createHazard();
+      st.known = createKnown(); // new maze ⇒ explore from scratch
+      st.replanAt = 0;
+    }
+    lapWinSent = false;
+  }
+
   onMount(() => {
-    const initial = createInitialGameState(defaultMaze);
+    const initial = createInitialGameState(activeMaze);
     gameStartTime = Date.now();
     gameState = { ...initial, status: 'playing', startedAt: gameStartTime };
     localGame.set(gameState);
 
     // Initialise evolving grid
     cellGrid = createCellGrid();
-    initGridFromMaze(cellGrid, defaultMaze);
-    if (defaultMaze.shortcut) protectZone(cellGrid, defaultMaze.shortcut.zone);
+    initGridFromMaze(cellGrid, activeMaze);
+    if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
 
     if (inputSource === 'keyboard') {
       cleanupFns.push(startKeyboardInput());
@@ -584,14 +629,23 @@
       let localBotPath: GridPath | null = null;
       let localBotWpIdx = 0;
       let localBotReplansAt = 0;
+      let localBotKnown = createKnown();
+      let localBotSeen = currentSeed;
 
       const localBotId = setInterval(() => {
         if (!cellGrid) return;
         const nowMs = Date.now();
         const { x, y } = gameState.ball.position;
-        // Re-plan every 2s or when path exhausted
+        // Maze morphed → forget the old layout and explore the new one
+        if (currentSeed !== localBotSeen) {
+          localBotKnown = createKnown();
+          localBotSeen = currentSeed;
+          localBotPath = null;
+        }
+        revealAround(localBotKnown, x, y);
+        // Re-plan every 2s or when path exhausted (fog: unseen cells assumed open)
         if (!localBotPath || nowMs > localBotReplansAt) {
-          localBotPath = bfsPath(cellGrid, x, y, defaultMaze.hole.x, defaultMaze.hole.y);
+          localBotPath = bfsPath(cellGrid, x, y, activeMaze.hole.x, activeMaze.hole.y, null, localBotKnown);
           localBotWpIdx = 0;
           localBotReplansAt = nowMs + 2000;
         }
@@ -606,6 +660,24 @@
 
     // Keep players store live during the game (lobby subscription died on unmount)
     cleanupFns.push(
+      // Watch the room's maze seed — when it changes (someone won a lap),
+      // morph the maze for everyone and flash the winner.
+      subscribeToRoom(roomId, (r) => {
+        if (!r) return;
+        currentLap = r.lap ?? 0;
+        const seed = seedFromMazeId(r.mazeId);
+        if (seed !== currentSeed) {
+          applyMaze(seed);
+          if (r.lastWinnerId && currentLap > 0) {
+            const w = get(players).find((p) => p.id === r.lastWinnerId);
+            const who = r.lastWinnerId === playerId ? 'You' : (w?.name ?? 'Bot');
+            lapFlash = `${who} won lap ${currentLap}!`;
+            if (lapFlashTimer) clearTimeout(lapFlashTimer);
+            lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1800);
+          }
+        }
+      }),
+
       subscribeToShortcut(roomId, (s) => { shortcutState = s; }),
 
       subscribeToMazeGrid(roomId, (b64) => {
@@ -629,11 +701,14 @@
           if (pl.inputSource === 'bot' && pl.id !== playerId && !botAIStates.has(pl.id)) {
             botAIStates.set(pl.id, {
               genome: defaultGenome(),
-              physics: { x: defaultMaze.startPosition.x, y: defaultMaze.startPosition.y, vx: 0, vy: 0 },
+              physics: { x: activeMaze.startPosition.x, y: activeMaze.startPosition.y, vx: 0, vy: 0 },
               path: null,
               waypointIdx: 0,
               lastProgress: 0,
               lastProgressTime: Date.now(),
+              hazard: createHazard(),
+              known: createKnown(),
+              replanAt: 0,
             });
           }
 
@@ -661,17 +736,20 @@
         if (!state) continue;
 
         // Progress towards hole
-        const hx = defaultMaze.hole.x, hy = defaultMaze.hole.y;
-        const sx = defaultMaze.startPosition.x, sy = defaultMaze.startPosition.y;
+        const hx = activeMaze.hole.x, hy = activeMaze.hole.y;
+        const sx = activeMaze.startPosition.x, sy = activeMaze.startPosition.y;
         const dpx = state.physics.x - sx, dpy = state.physics.y - sy;
         const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2);
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
         const dHx = state.physics.x - hx, dHy = state.physics.y - hy;
 
-        // Reached hole?
-        if (Math.sqrt(dHx * dHx + dHy * dHy) < defaultMaze.hole.radius - 6) {
-          botAIStates.delete(bot.id);
-          await finishPlayer(roomId, bot.id, nowMs - gameStartTime).catch(console.error);
+        // Reached hole? → bot wins the lap (endless morph). Don't delete the
+        // bot state; the maze regen broadcast resets all bots to start.
+        if (Math.sqrt(dHx * dHx + dHy * dHy) < activeMaze.hole.radius - 6) {
+          if (!lapWinSent) {
+            lapWinSent = true;
+            winLap(roomId, bot.id, currentLap, nowMs).catch(console.error);
+          }
           continue;
         }
 
@@ -682,6 +760,7 @@
           const ddx = state.physics.x - tx, ddy = state.physics.y - ty;
           if (ddx * ddx + ddy * ddy < 400) {
             triggerTrap(roomId, trapId).catch(console.error);
+            recordDeath(state.hazard, state.physics.x, state.physics.y);
             const newGenome = mutate(state.genome, progress);
             state = {
               genome: newGenome,
@@ -690,6 +769,9 @@
               waypointIdx: 0,
               lastProgress: 0,
               lastProgressTime: nowMs,
+              hazard: state.hazard,
+              known: state.known,
+              replanAt: 0,
             };
             botAIStates.set(bot.id, state);
             hitTrap = true;
@@ -704,6 +786,7 @@
           state.lastProgressTime = nowMs;
         }
         if (isStuck(progress, state.lastProgressTime, state.genome, nowMs)) {
+          recordDeath(state.hazard, state.physics.x, state.physics.y);
           const newGenome = mutate(state.genome, progress);
           state = {
             genome: newGenome,
@@ -712,15 +795,24 @@
             waypointIdx: 0,
             lastProgress: 0,
             lastProgressTime: nowMs,
+            hazard: state.hazard,
+            known: state.known,
+            replanAt: 0,
           };
           botAIStates.set(bot.id, state);
           continue;
         }
 
-        // Re-plan path if needed
-        if (!state.path) {
-          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, hx, hy);
+        // See what's nearby, then plan over only what's been discovered.
+        revealAround(state.known, state.physics.x, state.physics.y);
+
+        // Re-plan if pathless OR the cooldown elapsed — the latter lets the bot
+        // react to walls it just discovered through the fog. Hazard map steers
+        // around past deaths; known map gates what counts as a wall.
+        if (!state.path || nowMs >= state.replanAt) {
+          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, hx, hy, state.hazard, state.known);
           state.waypointIdx = 0;
+          state.replanAt = nowMs + 600;
         }
 
         // Compute input from genome + path + pheromone
@@ -729,8 +821,9 @@
         );
         state.waypointIdx = nextWaypointIdx;
 
-        // Step physics
+        // Step physics, then reveal the cells we moved into
         state.physics = stepBotPhysics(state.physics, botInput.x, botInput.y, cellGrid, botDt);
+        revealAround(state.known, state.physics.x, state.physics.y);
 
         // Bot deposits pheromone
         depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.05);
@@ -747,6 +840,7 @@
 
   onDestroy(() => {
     if (animFrameId) cancelAnimationFrame(animFrameId);
+    if (lapFlashTimer) clearTimeout(lapFlashTimer);
     for (const fn of cleanupFns) fn();
     cleanupFns = [];
     localGame.set(null);
@@ -760,9 +854,9 @@
     height={CANVAS_HEIGHT}
     style="max-width: 100%; display: block; margin: 0 auto;"
   />
-  {#if gameState?.status === 'finished'}
+  {#if lapFlash}
     <div class="finished-overlay">
-      <p>FINISHED! You reached the hole!</p>
+      <p>{lapFlash}</p>
     </div>
   {/if}
 </div>

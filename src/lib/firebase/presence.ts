@@ -1,4 +1,4 @@
-import { getDatabase, ref, onDisconnect, set, update } from "firebase/database";
+import { getDatabase, ref, onDisconnect, remove, update } from "firebase/database";
 import { getFirebaseApp } from "./app";
 
 export function setupPresence(roomId: string, playerId: string): () => void {
@@ -6,7 +6,8 @@ export function setupPresence(roomId: string, playerId: string): () => void {
   const playerRef = ref(database, `rooms/${roomId}/players/${playerId}`);
 
   update(playerRef, { online: true, lastSeenAt: Date.now() });
-  onDisconnect(playerRef).update({ online: false, lastSeenAt: Date.now() });
+  // Remove player on hard disconnect (refresh/tab-close) so they don't linger as ghosts
+  onDisconnect(playerRef).remove();
 
   const heartbeat = setInterval(() => {
     update(playerRef, { lastSeenAt: Date.now() });

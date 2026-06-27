@@ -15,11 +15,14 @@ export type TrapData = {
 export type Room = {
   id: string;
   status: RoomStatus;
-  mazeId: string;
+  mazeId: string; // numeric maze seed (as string); changes each lap
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
   winnerId?: string;
+  lap?: number; // endless-morph lap counter; bumped each win
+  lastWinnerId?: string; // winner of the most recent lap (for flash/score)
+  lapAt?: number; // when the current lap's maze was generated
   shortcut?: ShortcutState;
   mazeGrid?: string; // base64-encoded wall bitmap
 };
@@ -35,6 +38,7 @@ export type Player = {
   y?: number;
   finishedAt?: number;
   lastSeenAt?: number;
+  score?: number; // laps won (endless morph)
 };
 
 export type GameEvent =
