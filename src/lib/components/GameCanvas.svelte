@@ -37,6 +37,7 @@
   let activeMaze: Maze = defaultMaze;
   let currentSeed = DEFAULT_SEED;
   let currentLap = 0;
+  let lapInitialized = false; // skip the winner flash on first room sync (refresh)
   let lapWinSent = false; // guard: one winLap call per lap
   let lapFlash = ''; // transient winner banner
   let lapFlashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -48,13 +49,6 @@
 
   // Lerped display positions for opponents (smooths network lag)
   const opponentDisplayPos = new Map<string, { x: number; y: number }>();
-
-  // Pheromone trail history: playerId → [{x,y,t}]
-  type TrailPoint = { x: number; y: number; t: number };
-  const TRAIL_MAX_AGE = 3500;
-  const TRAIL_MAX_POINTS = 80;
-  const opponentTrails = new Map<string, TrailPoint[]>();
-  let localTrail: TrailPoint[] = [];
 
   // Shortcut gate state
   let shortcutState: ShortcutState | null = null;
@@ -115,22 +109,6 @@
     const drawNow = Date.now();
 
     if (cellGrid) {
-      // ── Pheromone heatmap ──────────────────────────────────
-      for (let r = 0; r < GRID_ROWS; r++) {
-        for (let c = 0; c < GRID_COLS; c++) {
-          const i = r * GRID_COLS + c;
-          const ph = cellGrid.pheromone[i];
-          if (ph < 0.02) continue;
-          ctx.globalAlpha = Math.min(0.75, ph);
-          // Amber → yellow → white as pheromone increases
-          const hue = 35 - ph * 15;
-          const light = 45 + ph * 25;
-          ctx.fillStyle = `hsl(${hue}, 100%, ${light}%)`;
-          ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
-        }
-      }
-      ctx.globalAlpha = 1;
-
       // ── Wall cells ─────────────────────────────────────────
       for (let r = 0; r < GRID_ROWS; r++) {
         for (let c = 0; c < GRID_COLS; c++) {
@@ -228,48 +206,7 @@
       }
     }
 
-    // ── Pheromone trails ───────────────────────────────────────
-    const now = Date.now();
-
-    // Local player trail
-    if (gameState) {
-      const lp = gameState.ball.position;
-      localTrail.push({ x: lp.x, y: lp.y, t: now });
-      if (localTrail.length > TRAIL_MAX_POINTS) localTrail.shift();
-      for (const pt of localTrail) {
-        const age = now - pt.t;
-        if (age > TRAIL_MAX_AGE) continue;
-        const alpha = (1 - age / TRAIL_MAX_AGE) * 0.25;
-        const r = 6 * (1 - age / TRAIL_MAX_AGE);
-        ctx.beginPath();
-        ctx.arc(pt.x, pt.y, Math.max(1, r), 0, Math.PI * 2);
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-    }
-
-    // Opponent trails
     const allPlayers = get(players);
-    for (const player of allPlayers) {
-      if (player.id === playerId) continue;
-      if (player.x == null || player.y == null) continue;
-      const trail = opponentTrails.get(player.id) ?? [];
-      const color = getPlayerColor(player.id);
-      for (const pt of trail) {
-        const age = now - pt.t;
-        if (age > TRAIL_MAX_AGE) continue;
-        const alpha = (1 - age / TRAIL_MAX_AGE) * 0.22;
-        const r = 6 * (1 - age / TRAIL_MAX_AGE);
-        ctx.beginPath();
-        ctx.arc(pt.x, pt.y, Math.max(1, r), 0, Math.PI * 2);
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = color;
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-    }
 
     // ── Opponents (lerped) ─────────────────────────────────────
     const lerpFactor = 1 - Math.exp(-12 * deltaTime);
@@ -362,16 +299,6 @@
         ctx.restore();
       }
 
-      // Evolution indicator — flashes briefly when maze just evolved
-      const anyEvolved = cellGrid && cellGrid.evolved.some((v) => v !== 0);
-      if (anyEvolved) {
-        ctx.save();
-        ctx.globalAlpha = 0.7;
-        ctx.fillStyle = '#44aaff';
-        ctx.font = '13px monospace';
-        ctx.fillText('MAZE EVOLVING', CANVAS_WIDTH / 2 - 55, CANVAS_HEIGHT - 30);
-        ctx.restore();
-      }
     }
 
     // Death flash overlay
@@ -446,14 +373,19 @@
         depositPheromone(cellGrid, gameState.ball.position.x, gameState.ball.position.y);
         for (const pl of get(players)) {
           if (pl.id === playerId || pl.x == null || pl.y == null) continue;
-          depositPheromone(cellGrid, pl.x, pl.y, 0.04);
+          depositPheromone(cellGrid, pl.x, pl.y, 0.08);
         }
         decayPheromone(cellGrid, deltaTime);
 
         // Evolution tick — host-driven
         if (nowMs - lastEvolutionTick > EVOLUTION_INTERVAL) {
           lastEvolutionTick = nowMs;
-          const sortedOnline = get(players).filter((p) => p.online).sort((a, b) => a.id.localeCompare(b.id));
+          // Host = first HUMAN by id. Bots must be excluded: a bot could sort
+          // first and "win" host, but bots never run this loop, so evolution
+          // would silently stop the moment bots joined (fired once, then never).
+          const sortedOnline = get(players)
+            .filter((p) => p.online && p.inputSource !== 'bot')
+            .sort((a, b) => a.id.localeCompare(b.id));
           // Fallback to self if no players loaded yet (Firebase async startup)
           const amHost = sortedOnline.length === 0 || sortedOnline[0].id === playerId;
           if (amHost) {
@@ -462,8 +394,8 @@
             const candidates = findNutrientPositions(cellGrid, 3);
             syncNutrients(roomId, candidates).catch(console.error);
 
-            // 30% chance to place a trap on a hot-path cell
-            if (Math.random() < 0.3) {
+            // Often place a trap on a hot-path cell
+            if (Math.random() < 0.6) {
               const existingTrapCells = Object.values(traps);
               const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells);
               if (trapCell) addTrap(roomId, trapCell.col, trapCell.row).catch(console.error);
@@ -664,14 +596,20 @@
       // morph the maze for everyone and flash the winner.
       subscribeToRoom(roomId, (r) => {
         if (!r) return;
-        currentLap = r.lap ?? 0;
+        const newLap = r.lap ?? 0;
+        const prevLap = currentLap;
+        const firstSync = !lapInitialized;
+        currentLap = newLap;
+        lapInitialized = true;
         const seed = seedFromMazeId(r.mazeId);
         if (seed !== currentSeed) {
           applyMaze(seed);
-          if (r.lastWinnerId && currentLap > 0) {
+          // Flash only on a real lap advance — not the initial sync on (re)load,
+          // which would otherwise replay the persisted winner ("You won lap 7").
+          if (!firstSync && newLap > prevLap && newLap > 0 && r.lastWinnerId) {
             const w = get(players).find((p) => p.id === r.lastWinnerId);
             const who = r.lastWinnerId === playerId ? 'You' : (w?.name ?? 'Bot');
-            lapFlash = `${who} won lap ${currentLap}!`;
+            lapFlash = `${who} won lap ${newLap}!`;
             if (lapFlashTimer) clearTimeout(lapFlashTimer);
             lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1800);
           }
@@ -695,9 +633,8 @@
 
       subscribeToPlayers(roomId, (p) => {
         players.set(p);
-        const t = Date.now();
         for (const pl of p) {
-          // Init bot AI state as soon as we see a bot — before position check
+          // Init bot AI state as soon as we see a bot
           if (pl.inputSource === 'bot' && pl.id !== playerId && !botAIStates.has(pl.id)) {
             botAIStates.set(pl.id, {
               genome: defaultGenome(),
@@ -711,12 +648,6 @@
               replanAt: 0,
             });
           }
-
-          if (pl.id === playerId || pl.x == null || pl.y == null) continue;
-          const trail = opponentTrails.get(pl.id) ?? [];
-          trail.push({ x: pl.x, y: pl.y, t });
-          if (trail.length > TRAIL_MAX_POINTS) trail.shift();
-          opponentTrails.set(pl.id, trail);
         }
       }),
     );
@@ -826,7 +757,7 @@
         revealAround(state.known, state.physics.x, state.physics.y);
 
         // Bot deposits pheromone
-        depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.05);
+        depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.1);
 
         await updatePlayerPosition(roomId, bot.id, state.physics.x, state.physics.y, progress).catch(console.error);
         botAIStates.set(bot.id, state);
@@ -855,9 +786,7 @@
     style="max-width: 100%; display: block; margin: 0 auto;"
   />
   {#if lapFlash}
-    <div class="finished-overlay">
-      <p>{lapFlash}</p>
-    </div>
+    <div class="lap-banner">{lapFlash}</div>
   {/if}
 </div>
 
@@ -877,23 +806,24 @@
     background: #1a1a2e;
   }
 
-  .finished-overlay {
+  /* Non-blocking winner notice — bottom banner so the maze stays fully
+     visible (the centered overlay used to hide the board for ~2s while
+     bots kept racing). */
+  .lap-banner {
     position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.6);
-    pointer-events: none;
-  }
-
-  .finished-overlay p {
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.72);
     color: #ffd700;
-    font-size: 2rem;
-    font-weight: bold;
     font-family: monospace;
-    text-align: center;
-    text-shadow: 0 0 20px rgba(255, 215, 0, 0.8);
-    padding: 1rem 2rem;
+    font-weight: bold;
+    font-size: 1rem;
+    white-space: nowrap;
+    padding: 0.4rem 1rem;
+    border-radius: 8px;
+    pointer-events: none;
+    text-shadow: 0 0 12px rgba(255, 215, 0, 0.7);
+    z-index: 30;
   }
 </style>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from "svelte";
-  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, addBotPlayer, startGame } from "$lib/firebase/rooms";
+  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, addBotPlayer, startGame, resetRoom, joinRoom } from "$lib/firebase/rooms";
   import { setupPresence } from "$lib/firebase/presence";
   import { players, currentPlayerId } from "$lib/stores/playerStore";
   import { room } from "$lib/stores/roomStore";
@@ -19,10 +19,14 @@
   let isReady = false;
   let botCount = 1;
   let addingBots = false;
+  let restarting = false;
+  // True if a game was already in progress when we arrived — then we don't
+  // auto-enter; the user explicitly chooses Join Game or Restart for all.
+  let lateArrival = false;
+  let statusChecked = false;
 
   $: myId = $currentPlayerId;
   $: me = $players.find((p) => p.id === myId);
-  $: isHost = $players.length > 0 && $players[0].id === myId;
   // Startable = a room exists that isn't already running or done. Guarding on
   // "not playing/finished" (instead of exactly "waiting") also recovers a
   // shared room left stuck in a stale status by a previous session.
@@ -56,13 +60,42 @@
     if (myId && startable) startGame(roomId);
   }
 
-  $: if ($room?.status === "playing" && !gameStarted) {
+  // Explicitly enter a game already in progress.
+  function joinGame() {
+    gameStarted = true;
+    dispatch("start");
+  }
+
+  // Restart for all: wipe players, bots and level, then re-join a fresh lobby.
+  async function handleRestart() {
+    if (!myId) return;
+    restarting = true;
+    try {
+      await resetRoom(roomId);
+      await joinRoom(roomId, playerName, inputSource);
+      isReady = false;
+      gameStarted = false;
+      lateArrival = false;
+    } finally {
+      restarting = false;
+    }
+  }
+
+  // Auto-enter only when WE drove the room into "playing" (not when we arrived
+  // to a game already running — that case shows an explicit Join Game button).
+  $: if ($room?.status === "playing" && !gameStarted && !lateArrival) {
     gameStarted = true;
     dispatch("start");
   }
 
   onMount(() => {
-    unsubRoom = subscribeToRoom(roomId, (r) => room.set(r));
+    unsubRoom = subscribeToRoom(roomId, (r) => {
+      room.set(r);
+      if (!statusChecked && r) {
+        lateArrival = r.status === "playing";
+        statusChecked = true;
+      }
+    });
     unsubPlayers = subscribeToPlayers(roomId, (p) => players.set(p));
     if (myId) cleanupPresence = setupPresence(roomId, myId);
   });
@@ -128,16 +161,22 @@
     </div>
   </div>
 
-  {#if isHost}
+  {#if $room?.status === "playing"}
+    <button class="btn-start" on:click={joinGame}>Join Game in progress</button>
+  {:else}
     <button class="btn-start" on:click={handleStartNow} disabled={!startable}>
       Start Game
     </button>
   {/if}
 
-  {#if !isHost && $players.length < 2}
-    <p class="status-msg">Waiting for the host to start...</p>
+  <button class="btn-restart" on:click={handleRestart} disabled={restarting}>
+    {restarting ? "Restarting…" : "Restart for all"}
+  </button>
+
+  {#if $room?.status === "playing"}
+    <p class="status-msg">A game is in progress. Join it, or restart for everyone.</p>
   {:else if !allReady}
-    <p class="status-msg">Ready up — host can start any time.</p>
+    <p class="status-msg">Ready up, or just press Start.</p>
   {/if}
 </div>
 
@@ -314,6 +353,26 @@
 
   .btn-start:disabled {
     opacity: 0.4;
+    cursor: default;
+  }
+
+  .btn-restart {
+    width: 100%;
+    padding: 0.65rem;
+    border: 1px solid #6a3a3a;
+    border-radius: 10px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    background: transparent;
+    color: #d68a8a;
+  }
+
+  .btn-restart:hover:not(:disabled) {
+    background: rgba(80, 30, 30, 0.4);
+  }
+
+  .btn-restart:disabled {
+    opacity: 0.5;
     cursor: default;
   }
 
