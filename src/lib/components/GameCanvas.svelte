@@ -142,6 +142,51 @@
     return (Math.abs(hash) & 1) === 0;
   }
 
+  // A little battlemented keep, drawn in world space at (cx,cy). Used to mark
+  // both ends: the player's home (start) and the enemy lair (hole). Cheap —
+  // ~a dozen path ops, two per frame.
+  type KeepPalette = { wall: string; trim: string; door: string; flag: string };
+  function drawKeep(c: CanvasRenderingContext2D, cx: number, cy: number, pal: KeepPalette) {
+    const w = 16, h = 13;               // half-extents of the body
+    const left = cx - w, top = cy - h;
+    const merlon = (w * 2) / 7;         // battlement tooth size
+    // Body
+    c.fillStyle = pal.wall;
+    c.fillRect(left, top, w * 2, h * 2);
+    // Crenellations along the top (4 merlons)
+    c.fillStyle = pal.trim;
+    for (let i = 0; i < 4; i++) c.fillRect(left + i * 2 * merlon, top - merlon, merlon, merlon);
+    // Body outline
+    c.strokeStyle = pal.trim;
+    c.lineWidth = 2;
+    c.strokeRect(left, top, w * 2, h * 2);
+    // Arched door (sits on the base line)
+    const dw = 14, dyb = cy + h, archY = dyb - 14;
+    c.fillStyle = pal.door;
+    c.beginPath();
+    c.moveTo(cx - dw / 2, dyb);
+    c.lineTo(cx - dw / 2, archY);
+    c.arc(cx, archY, dw / 2, Math.PI, Math.PI * 2); // upper dome
+    c.lineTo(cx + dw / 2, dyb);
+    c.closePath();
+    c.fill();
+    // Flag pole + pennant
+    const poleTop = top - merlon - 12;
+    c.strokeStyle = pal.trim;
+    c.lineWidth = 1.5;
+    c.beginPath();
+    c.moveTo(cx, top - merlon);
+    c.lineTo(cx, poleTop);
+    c.stroke();
+    c.fillStyle = pal.flag;
+    c.beginPath();
+    c.moveTo(cx, poleTop);
+    c.lineTo(cx + 10, poleTop + 3);
+    c.lineTo(cx, poleTop + 6);
+    c.closePath();
+    c.fill();
+  }
+
   // Current position of a shot, derived purely from how long it's been alive.
   function shotXY(s: ShotData, nowMs: number): { x: number; y: number; age: number } {
     const age = (nowMs - s.firedAt) / 1000;
@@ -343,6 +388,15 @@
       }
     }
 
+    // ── Bases: player home at the start, enemy lair at the hole ──
+    // Drawn before the balls so marbles/zombies sit in front of the gates.
+    drawKeep(ctx, maze.hole.x, maze.hole.y, {
+      wall: '#2a0d0d', trim: '#ffd700', door: '#000000', flag: '#e0241c',
+    });
+    drawKeep(ctx, maze.startPosition.x, maze.startPosition.y, {
+      wall: '#15324a', trim: '#3fa7ff', door: '#0a1822', flag: '#00ff88',
+    });
+
     const allPlayers = get(players);
 
     // ── Opponents (lerped) ─────────────────────────────────────
@@ -386,23 +440,6 @@
         ctx.globalAlpha = 1;
       }
     }
-
-    // Draw hole: dark circle with gold border
-    ctx.beginPath();
-    ctx.arc(maze.hole.x, maze.hole.y, maze.hole.radius, 0, Math.PI * 2);
-    ctx.fillStyle = '#0a0a1a';
-    ctx.fill();
-    ctx.strokeStyle = '#ffd700';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-
-    // Draw start position marker
-    ctx.beginPath();
-    ctx.arc(maze.startPosition.x, maze.startPosition.y, 8, 0, Math.PI * 2);
-    ctx.globalAlpha = 0.6;
-    ctx.fillStyle = '#00ff88';
-    ctx.fill();
-    ctx.globalAlpha = 1;
 
     // Draw local player marble: white with shadow
     if (gameState) {
