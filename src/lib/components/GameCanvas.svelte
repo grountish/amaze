@@ -92,6 +92,8 @@
   let consumedShots = new Set<string>(); // ids we've already resolved locally
   let lastShotAt = 0;
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
+  const WALL_HP = 3; // shots to break a wall cell
+  let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
 
   // Player death / respawn
   let deathFlashUntil = 0;
@@ -208,6 +210,25 @@
     // Blit the cached maze layer (opaque bg → also clears the previous frame).
     if (mazeLayerDirty) { renderMazeLayer(); mazeLayerDirty = false; }
     if (mazeLayer) ctx.drawImage(mazeLayer, 0, 0);
+
+    // ── Cracks on walls I've damaged (local) — builds toward breaking ──
+    if (cellGrid && wallHits.size) {
+      ctx.strokeStyle = '#ffcaa0';
+      ctx.lineWidth = 1.5;
+      for (const [ci, hits] of wallHits) {
+        if (!cellGrid.walls[ci]) { wallHits.delete(ci); continue; }
+        const cx = (ci % GRID_COLS) * CELL_SIZE;
+        const cy = Math.floor(ci / GRID_COLS) * CELL_SIZE;
+        ctx.beginPath();
+        // one slash per hit landed so far
+        for (let h = 0; h < hits; h++) {
+          const off = 4 + h * 6;
+          ctx.moveTo(cx + off, cy + 3);
+          ctx.lineTo(cx + off - 4, cy + CELL_SIZE - 3);
+        }
+        ctx.stroke();
+      }
+    }
 
     {
       // ── Nutrients ──────────────────────────────────────────
@@ -606,15 +627,21 @@
           if (p.x < 0 || p.y < 0 || p.x > WORLD_WIDTH || p.y > WORLD_HEIGHT) {
             consumedShots.add(id); toPrune.push(id); continue;
           }
-          // Wall hit → carve the cell open.
+          // Wall hit → chip the cell; it opens only after WALL_HP hits.
           if (cellGrid) {
             const cc = Math.floor(p.x / CELL_SIZE), cr = Math.floor(p.y / CELL_SIZE);
             const ci = cr * GRID_COLS + cc;
             if (cellGrid.walls[ci] && cellGrid.hardness[ci] !== 255) {
-              cellGrid.walls[ci] = 0;
-              cellGrid.hardness[ci] = 0;
-              mazeLayerDirty = true;
-              updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
+              const hits = (wallHits.get(ci) ?? 0) + 1;
+              if (hits >= WALL_HP) {
+                wallHits.delete(ci);
+                cellGrid.walls[ci] = 0;
+                cellGrid.hardness[ci] = 0;
+                mazeLayerDirty = true;
+                updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
+              } else {
+                wallHits.set(ci, hits); // crack overlay shows the progress
+              }
               consumedShots.add(id); toPrune.push(id);
               continue;
             }
@@ -743,6 +770,7 @@
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     cellGrid.pheromone.fill(0);
     cellGrid.evolved.fill(0);
+    wallHits.clear(); // wall damage doesn't carry to a fresh maze
     mazeLayerDirty = true; // brand-new maze ⇒ re-rasterise
     // Reset local ball to start
     if (gameState) {
@@ -755,7 +783,8 @@
     }
     // Reset all bots to start; new maze ⇒ fresh hazard map (old deaths are stale)
     for (const st of botAIStates.values()) {
-      st.physics = { x: activeMaze.startPosition.x, y: activeMaze.startPosition.y, vx: 0, vy: 0 };
+      st.physics = { x: activeMaze.hole.x, y: activeMaze.hole.y, vx: 0, vy: 0 }; // bots spawn at the hole
+
       st.path = null;
       st.waypointIdx = 0;
       st.lastProgress = 0;
@@ -881,7 +910,8 @@
           if (pl.inputSource === 'bot' && pl.id !== playerId && !botAIStates.has(pl.id)) {
             botAIStates.set(pl.id, {
               genome: defaultGenome(),
-              physics: { x: activeMaze.startPosition.x, y: activeMaze.startPosition.y, vx: 0, vy: 0 },
+              // Battle mode: bots spawn at the hole and race toward the human's start.
+              physics: { x: activeMaze.hole.x, y: activeMaze.hole.y, vx: 0, vy: 0 },
               path: null,
               waypointIdx: 0,
               lastProgress: 0,
@@ -917,23 +947,23 @@
 
         // Shot down (hp ran out) → respawn at start with fresh hp.
         if (bot.hp != null && bot.hp <= 0) {
-          state = { ...state, physics: { x: sx, y: sy, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
+          state = { ...state, physics: { x: hx, y: hy, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
           botAIStates.set(bot.id, state);
           setPlayerHp(roomId, bot.id, MAX_HP).catch(console.error);
-          botWrites.push({ id: bot.id, x: sx, y: sy, progress: 0 });
+          botWrites.push({ id: bot.id, x: hx, y: hy, progress: 0 });
           continue;
         }
 
-        // Progress towards hole
-        const dpx = state.physics.x - sx, dpy = state.physics.y - sy;
+        // Bot progress = how far it's travelled from its spawn (the hole) toward
+        // the human's start, which is its goal.
+        const dpx = state.physics.x - hx, dpy = state.physics.y - hy;
         const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2) || 1; // avoid /0
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
-        const dHx = state.physics.x - hx, dHy = state.physics.y - hy;
+        const dGx = state.physics.x - sx, dGy = state.physics.y - sy;
 
-        // Reached hole? → ALWAYS score this bot's lap and reset only it (so it
-        // doesn't camp the hole). The first finisher of the round also advances
-        // the maze for everyone (gated); applyMaze then resets all racers.
-        if (Math.sqrt(dHx * dHx + dHy * dHy) < activeMaze.hole.radius - 6) {
+        // Reached the human's start? → score this bot and reset only it. The
+        // first finisher of the round also advances the maze for everyone (gated).
+        if (Math.sqrt(dGx * dGx + dGy * dGy) < 16) {
           scoreLap(roomId, bot.id).catch(console.error);
           if (!lapWinSent) {
             lapWinSent = true;
@@ -944,7 +974,7 @@
           }
           state = {
             ...state,
-            physics: { x: sx, y: sy, vx: 0, vy: 0 },
+            physics: { x: hx, y: hy, vx: 0, vy: 0 },
             path: null,
             waypointIdx: 0,
             lastProgress: 0,
@@ -965,7 +995,7 @@
             const newGenome = mutate(state.genome, progress);
             state = {
               genome: newGenome,
-              physics: { x: sx, y: sy, vx: 0, vy: 0 },
+              physics: { x: hx, y: hy, vx: 0, vy: 0 },
               path: null,
               waypointIdx: 0,
               lastProgress: 0,
@@ -991,7 +1021,7 @@
           const newGenome = mutate(state.genome, progress);
           state = {
             genome: newGenome,
-            physics: { x: sx, y: sy, vx: 0, vy: 0 },
+            physics: { x: hx, y: hy, vx: 0, vy: 0 },
             path: null,
             waypointIdx: 0,
             lastProgress: 0,
@@ -1011,7 +1041,7 @@
         // react to walls it just discovered through the fog. Hazard map steers
         // around past deaths; known map gates what counts as a wall.
         if (!state.path || nowMs >= state.replanAt) {
-          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, hx, hy, state.hazard, state.known);
+          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, sx, sy, state.hazard, state.known);
           state.waypointIdx = 0;
           state.replanAt = nowMs + 600;
         }
