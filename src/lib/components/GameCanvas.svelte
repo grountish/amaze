@@ -824,15 +824,11 @@
         }
       }
 
-      // Track aim as a unit cardinal heading from actual motion. Only update
-      // when moving with intent (threshold skips jitter); hold it when ~still,
-      // so the aim line + shots keep pointing where you last went.
-      {
-        const vx = gameState.ball.velocity.x, vy = gameState.ball.velocity.y;
-        if (vx * vx + vy * vy > 18 * 18) {
-          const s = snapCardinal({ x: vx, y: vy });
-          lastHeading = { x: Math.sign(s.x), y: Math.sign(s.y) };
-        }
+      // Aim follows the direction you're pressing (cardinal) — so you can re-aim
+      // while blocked against a wall without moving. currentInput is already
+      // snapped to one axis; hold the last heading when no key is down.
+      if (currentInput.x !== 0 || currentInput.y !== 0) {
+        lastHeading = { x: Math.sign(currentInput.x), y: Math.sign(currentInput.y) };
       }
 
       // Shortcut zone entry/exit detection
