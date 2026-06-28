@@ -10,7 +10,8 @@
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { updatePlayerPosition, winLap, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
+  import { setupPresence } from '$lib/firebase/presence';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState, TrapData } from '$lib/firebase/types';
   import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
@@ -25,8 +26,19 @@
 
   $: debugMode.set(debug);
 
-  const CANVAS_WIDTH = 800;
-  const CANVAS_HEIGHT = 600;
+  // Full world (the whole maze) vs the viewport we actually render into.
+  const WORLD_WIDTH = GRID_COLS * CELL_SIZE;
+  const WORLD_HEIGHT = GRID_ROWS * CELL_SIZE;
+  // Canvas backbuffer = the full world, rendered 1:1 (crisp). CSS then scales the
+  // whole thing up to fill the screen, so we zoom in WITHOUT cropping.
+  const CANVAS_WIDTH = WORLD_WIDTH;
+  const CANVAS_HEIGHT = WORLD_HEIGHT;
+  // Auto-fit: scale so the WHOLE world fits the viewport (whichever axis is
+  // tighter), so the entire maze is always visible with no crop. The
+  // follow-camera clamp below then pins to (0,0) on its own.
+  const ZOOM = Math.min(CANVAS_WIDTH / WORLD_WIDTH, CANVAS_HEIGHT / WORLD_HEIGHT);
+  // How long a trap telegraphs (warning ring) before it becomes lethal.
+  const TRAP_ARM_MS = 1500;
   const POSITION_SYNC_THROTTLE = 50;
 
   const PLAYER_COLORS = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dda0dd'];
@@ -36,9 +48,8 @@
   // Active procedural maze (changes each lap in endless morph)
   let activeMaze: Maze = defaultMaze;
   let currentSeed = DEFAULT_SEED;
-  let currentLap = 0;
-  let lapInitialized = false; // skip the winner flash on first room sync (refresh)
-  let lapWinSent = false; // guard: one winLap call per lap
+  let myLaps = 0; // this player's completed personal laps (for the banner)
+  let lapWinSent = false; // guard: one maze-advance per lap (whoever finishes first)
   let lapFlash = ''; // transient winner banner
   let lapFlashTimer: ReturnType<typeof setTimeout> | null = null;
   let animFrameId: number;
@@ -57,6 +68,7 @@
   // Evolving maze grid
   let cellGrid: CellGrid | null = null;
   let lastEvolutionTick = 0;
+  let lastPheromoneDecay = 0;
 
   // Nutrients & speed boosts
   let nutrients: Record<string, NutrientData> = {};
@@ -88,11 +100,51 @@
   let lastFrameTime: number = 0;
 
   function getPlayerColor(pid: string): string {
+    if (!pid) return PLAYER_COLORS[0];
     let hash = 0;
     for (let i = 0; i < pid.length; i++) {
       hash = (hash * 31 + pid.charCodeAt(i)) & 0xffffffff;
     }
     return PLAYER_COLORS[Math.abs(hash) % PLAYER_COLORS.length];
+  }
+
+  // The maze walls + Turing tint only change on the 1.5s evolution tick, not
+  // per frame. Rasterise them once into this offscreen layer and blit it each
+  // frame — avoids re-scanning all GRID_COLS×GRID_ROWS cells (and allocating an
+  // rgba string per cell) 60×/s, which is what made the doubled maze lag.
+  let mazeLayer: HTMLCanvasElement | null = null;
+  let mazeLayerDirty = true;
+
+  function renderMazeLayer() {
+    if (!mazeLayer) {
+      mazeLayer = document.createElement('canvas');
+      mazeLayer.width = WORLD_WIDTH; // the full maze, not the viewport
+      mazeLayer.height = WORLD_HEIGHT;
+    }
+    const mctx = mazeLayer.getContext('2d');
+    if (!mctx) return;
+
+    mctx.fillStyle = '#06060f';
+    mctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+
+    if (cellGrid) {
+      // Wall cells
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          const i = r * GRID_COLS + c;
+          if (!cellGrid.walls[i]) continue;
+          const ev = cellGrid.evolved[i];
+          mctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
+          mctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+        }
+      }
+    } else {
+      // Fallback: static walls while grid initialises
+      mctx.fillStyle = '#2e2e50';
+      for (const wall of activeMaze.walls) {
+        mctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+      }
+    }
   }
 
   function draw(deltaTime: number) {
@@ -102,24 +154,24 @@
 
     const maze = activeMaze;
 
-    // Clear with dark background
-    ctx.fillStyle = '#06060f';
-    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
     const drawNow = Date.now();
 
-    if (cellGrid) {
-      // ── Wall cells ─────────────────────────────────────────
-      for (let r = 0; r < GRID_ROWS; r++) {
-        for (let c = 0; c < GRID_COLS; c++) {
-          const i = r * GRID_COLS + c;
-          if (!cellGrid.walls[i]) continue;
-          const ev = cellGrid.evolved[i];
-          ctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
-          ctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
-        }
-      }
+    // ── Camera: zoom in and follow the local ball, clamped to the world so we
+    // never show past the edges. World-space drawing happens under this
+    // transform; the HUD/overlays reset to screen space below.
+    const camBallX = gameState ? gameState.ball.position.x : WORLD_WIDTH / 2;
+    const camBallY = gameState ? gameState.ball.position.y : WORLD_HEIGHT / 2;
+    const viewW = CANVAS_WIDTH / ZOOM;
+    const viewH = CANVAS_HEIGHT / ZOOM;
+    const camX = Math.max(0, Math.min(WORLD_WIDTH - viewW, camBallX - viewW / 2));
+    const camY = Math.max(0, Math.min(WORLD_HEIGHT - viewH, camBallY - viewH / 2));
+    ctx.setTransform(ZOOM, 0, 0, ZOOM, -camX * ZOOM, -camY * ZOOM);
 
+    // Blit the cached maze layer (opaque bg → also clears the previous frame).
+    if (mazeLayerDirty) { renderMazeLayer(); mazeLayerDirty = false; }
+    if (mazeLayer) ctx.drawImage(mazeLayer, 0, 0);
+
+    {
       // ── Nutrients ──────────────────────────────────────────
       for (const [, n] of Object.entries(nutrients)) {
         if (n.expiresAt < drawNow) continue;
@@ -127,8 +179,6 @@
         const ny = n.row * CELL_SIZE + CELL_SIZE / 2;
         const pulse = 0.6 + 0.4 * Math.sin(drawNow / 300 + n.col);
         ctx.save();
-        ctx.shadowColor = '#ffd700';
-        ctx.shadowBlur = 14 * pulse;
         ctx.beginPath();
         ctx.arc(nx, ny, 5 * pulse, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
@@ -140,24 +190,37 @@
       for (const [, trap] of Object.entries(traps)) {
         const tx = trap.col * CELL_SIZE + CELL_SIZE / 2;
         const ty = trap.row * CELL_SIZE + CELL_SIZE / 2;
-        const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
-        const sz = 5 * pulse;
-        ctx.save();
-        ctx.shadowColor = '#ff2222';
-        ctx.shadowBlur = 10 * pulse;
-        ctx.strokeStyle = `rgba(255,30,30,${0.8 + 0.2 * pulse})`;
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        ctx.moveTo(tx - sz, ty - sz); ctx.lineTo(tx + sz, ty + sz);
-        ctx.moveTo(tx + sz, ty - sz); ctx.lineTo(tx - sz, ty + sz);
-        ctx.stroke();
-        ctx.restore();
-      }
-    } else {
-      // Fallback: static walls while grid initialises
-      ctx.fillStyle = '#2e2e50';
-      for (const wall of activeMaze.walls) {
-        ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+        const arming = trap.armAt != null && drawNow < trap.armAt;
+        if (arming) {
+          // Telegraph: an amber ring closes in as the trap arms, so the danger
+          // is visible from a distance well before it can kill you.
+          const progress = Math.max(0, Math.min(1, 1 - (trap.armAt! - drawNow) / TRAP_ARM_MS));
+          const ringR = 26 - 14 * progress; // shrinks toward the cell
+          const blink = 0.5 + 0.5 * Math.sin(drawNow / 90);
+          ctx.save();
+          ctx.strokeStyle = `rgba(255,190,40,${0.45 + 0.45 * blink})`;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(tx, ty, ringR, 0, Math.PI * 2);
+          ctx.stroke();
+          // Center dot growing toward "live"
+          ctx.fillStyle = `rgba(255,120,30,${0.3 + 0.5 * progress})`;
+          ctx.beginPath();
+          ctx.arc(tx, ty, 2 + 3 * progress, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        } else {
+          const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
+          const sz = 5 * pulse;
+          ctx.save();
+          ctx.strokeStyle = `rgba(255,30,30,${0.8 + 0.2 * pulse})`;
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.moveTo(tx - sz, ty - sz); ctx.lineTo(tx + sz, ty + sz);
+          ctx.moveTo(tx + sz, ty - sz); ctx.lineTo(tx - sz, ty + sz);
+          ctx.stroke();
+          ctx.restore();
+        }
       }
     }
 
@@ -173,8 +236,6 @@
         // Red pulsing wall + countdown
         const pulse = 0.6 + 0.4 * Math.sin(now / 120);
         ctx.save();
-        ctx.shadowColor = '#ff4444';
-        ctx.shadowBlur = 16 * pulse;
         ctx.fillStyle = `rgba(200, 40, 40, ${pulse})`;
         ctx.fillRect(gapWall.x, gapWall.y, gapWall.width, gapWall.height);
         ctx.restore();
@@ -187,8 +248,6 @@
         // Green glowing open gate
         const pulse = 0.5 + 0.5 * Math.sin(now / 400);
         ctx.save();
-        ctx.shadowColor = '#00ffaa';
-        ctx.shadowBlur = 18 * pulse;
         ctx.strokeStyle = `rgba(0, 255, 170, ${0.4 + 0.4 * pulse})`;
         ctx.lineWidth = 3;
         ctx.beginPath();
@@ -269,14 +328,15 @@
     if (gameState) {
       const { position, radius } = gameState.ball;
       ctx.save();
-      ctx.shadowColor = 'rgba(255, 255, 255, 0.4)';
-      ctx.shadowBlur = 12;
       ctx.beginPath();
       ctx.arc(position.x, position.y, radius, 0, Math.PI * 2);
       ctx.fillStyle = '#ffffff';
       ctx.fill();
       ctx.restore();
     }
+
+    // Back to screen space for the HUD / overlays (no camera transform).
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
 
     // HUD — bottom bar
     if (gameState) {
@@ -291,8 +351,6 @@
         const remaining = Math.max(0, Math.ceil((activeBoosts[0].expires - now_hud) / 1000));
         const factor = activeBoosts.reduce((f, b) => f * b.factor, 1.0);
         ctx.save();
-        ctx.shadowColor = '#ffd700';
-        ctx.shadowBlur = 8;
         ctx.fillStyle = '#ffd700';
         ctx.font = 'bold 15px monospace';
         ctx.fillText(`⚡ ×${factor.toFixed(1)} ${remaining}s`, CANVAS_WIDTH - 140, CANVAS_HEIGHT - 30);
@@ -320,8 +378,9 @@
       }
     }
 
-    // Debug: draw input vector as arrow from ball center
+    // Debug: draw input vector as arrow from ball center (world space).
     if (debug && gameState) {
+      ctx.setTransform(ZOOM, 0, 0, ZOOM, -camX * ZOOM, -camY * ZOOM);
       const currentInput = get(input);
       const { position } = gameState.ball;
       const arrowLen = 50;
@@ -375,7 +434,13 @@
           if (pl.id === playerId || pl.x == null || pl.y == null) continue;
           depositPheromone(cellGrid, pl.x, pl.y, 0.08);
         }
-        decayPheromone(cellGrid, deltaTime);
+        // Decay at ~6Hz, not per frame. Pheromone isn't rendered and only feeds
+        // evolution/bot-steer/trap-pick (all ≥600ms), so 60Hz over 4800 cells was
+        // pure waste. Passing the accumulated dt keeps the decay rate identical.
+        if (nowMs - lastPheromoneDecay > 160) {
+          decayPheromone(cellGrid, (nowMs - lastPheromoneDecay) / 1000);
+          lastPheromoneDecay = nowMs;
+        }
 
         // Evolution tick — host-driven
         if (nowMs - lastEvolutionTick > EVOLUTION_INTERVAL) {
@@ -389,16 +454,25 @@
           // Fallback to self if no players loaded yet (Firebase async startup)
           const amHost = sortedOnline.length === 0 || sortedOnline[0].id === playerId;
           if (amHost) {
-            evolveGrid(cellGrid, activeMaze);
+            evolveGrid(cellGrid, activeMaze); // also advances the Turing field
+            mazeLayerDirty = true; // host: walls just changed
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
             const candidates = findNutrientPositions(cellGrid, 3);
             syncNutrients(roomId, candidates).catch(console.error);
 
-            // Often place a trap on a hot-path cell
+            // Often place a trap on a hot-path cell — but never on top of a
+            // live racer, and with a warning delay before it goes lethal.
             if (Math.random() < 0.6) {
               const existingTrapCells = Object.values(traps);
-              const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells);
-              if (trapCell) addTrap(roomId, trapCell.col, trapCell.row).catch(console.error);
+              // Cells currently occupied by any racer (self + opponents).
+              const playerCells = [
+                { col: Math.floor(gameState.ball.position.x / CELL_SIZE), row: Math.floor(gameState.ball.position.y / CELL_SIZE) },
+                ...get(players)
+                  .filter((p) => p.x != null && p.y != null)
+                  .map((p) => ({ col: Math.floor(p.x! / CELL_SIZE), row: Math.floor(p.y! / CELL_SIZE) })),
+              ];
+              const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells, playerCells);
+              if (trapCell) addTrap(roomId, trapCell.col, trapCell.row, nowMs + TRAP_ARM_MS).catch(console.error);
             }
           }
         }
@@ -425,6 +499,8 @@
       if (gameState.status === 'playing') {
         for (const [id, trap] of Object.entries(traps)) {
           if (triggeredTraps.has(id)) continue;
+          // Not lethal until armed — the warning ring gives you time to dodge.
+          if (trap.armAt != null && nowMs < trap.armAt) continue;
           const tx = (trap.col + 0.5) * CELL_SIZE;
           const ty = (trap.row + 0.5) * CELL_SIZE;
           const ddx = gameState.ball.position.x - tx;
@@ -460,6 +536,17 @@
       const frameMaze = { ...activeMaze, walls: localWalls };
       gameState = updateGame(gameState, frameMaze, currentInput, deltaTime, speedFactor);
 
+      // Safety net: never let the ball leave the maze bounds / go off-screen.
+      {
+        const rr = gameState.ball.radius;
+        const maxX = GRID_COLS * CELL_SIZE - rr, maxY = GRID_ROWS * CELL_SIZE - rr;
+        const bx = Math.max(rr, Math.min(maxX, gameState.ball.position.x));
+        const by = Math.max(rr, Math.min(maxY, gameState.ball.position.y));
+        if (bx !== gameState.ball.position.x || by !== gameState.ball.position.y) {
+          gameState = { ...gameState, ball: { ...gameState.ball, position: { x: bx, y: by } } };
+        }
+      }
+
       // Shortcut zone entry/exit detection
       if (activeMaze.shortcut) {
         const { x, y } = gameState.ball.position;
@@ -490,14 +577,25 @@
         }
       }
 
-      // Reached the hole → win this lap (endless morph). The maze regenerates
-      // for everyone via the room's seed; we keep playing until the broadcast
-      // resets positions. lapWinSent guards one win per lap.
-      if (gameState.status === 'finished' && !lapWinSent) {
-        lapWinSent = true;
-        winLap(roomId, playerId, currentLap, Date.now()).catch(console.error);
-        // Unfreeze locally so the ball isn't stuck "finished" before the reset
-        gameState = { ...gameState, status: 'playing' };
+      // Reached the hole → ALWAYS score my own lap (even if a bot triggered
+      // this round's morph first). Only the maze advance is gated to one per
+      // round. Respawn locally; the seed broadcast swaps in the fresh maze.
+      if (gameState.status === 'finished') {
+        scoreLap(roomId, playerId).catch(console.error);
+        myLaps += 1;
+        lapFlash = `Lap ${myLaps} complete!`;
+        if (lapFlashTimer) clearTimeout(lapFlashTimer);
+        lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
+        if (!lapWinSent) {
+          lapWinSent = true;
+          advanceMaze(roomId).catch(console.error);
+        }
+        gameState = {
+          ...gameState,
+          ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
+          status: 'playing',
+          progress: 0,
+        };
         localGame.set(gameState);
       }
     }
@@ -517,6 +615,7 @@
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     cellGrid.pheromone.fill(0);
     cellGrid.evolved.fill(0);
+    mazeLayerDirty = true; // brand-new maze ⇒ re-rasterise
     // Reset local ball to start
     if (gameState) {
       gameState = {
@@ -537,7 +636,7 @@
       st.known = createKnown(); // new maze ⇒ explore from scratch
       st.replanAt = 0;
     }
-    lapWinSent = false;
+    lapWinSent = false; // fresh maze ⇒ the next finisher can advance again
   }
 
   onMount(() => {
@@ -545,6 +644,11 @@
     gameStartTime = Date.now();
     gameState = { ...initial, status: 'playing', startedAt: gameStartTime };
     localGame.set(gameState);
+
+    // Re-assert presence: the lobby's onDestroy set us online:false, which
+    // otherwise drops us from subscribeToPlayers (and the scoreboard) for the
+    // whole game — so our laps would never show. Restores online:true + heartbeat.
+    if (playerId) cleanupFns.push(setupPresence(roomId, playerId));
 
     // Initialise evolving grid
     cellGrid = createCellGrid();
@@ -592,28 +696,13 @@
 
     // Keep players store live during the game (lobby subscription died on unmount)
     cleanupFns.push(
-      // Watch the room's maze seed — when it changes (someone won a lap),
-      // morph the maze for everyone and flash the winner.
+      // Watch the room's maze seed — it only changes on "Restart for all",
+      // which regenerates a fresh maze for everyone. Personal laps no longer
+      // morph the maze, so normal play keeps the same (evolving) maze.
       subscribeToRoom(roomId, (r) => {
         if (!r) return;
-        const newLap = r.lap ?? 0;
-        const prevLap = currentLap;
-        const firstSync = !lapInitialized;
-        currentLap = newLap;
-        lapInitialized = true;
         const seed = seedFromMazeId(r.mazeId);
-        if (seed !== currentSeed) {
-          applyMaze(seed);
-          // Flash only on a real lap advance — not the initial sync on (re)load,
-          // which would otherwise replay the persisted winner ("You won lap 7").
-          if (!firstSync && newLap > prevLap && newLap > 0 && r.lastWinnerId) {
-            const w = get(players).find((p) => p.id === r.lastWinnerId);
-            const who = r.lastWinnerId === playerId ? 'You' : (w?.name ?? 'Bot');
-            lapFlash = `${who} won lap ${newLap}!`;
-            if (lapFlashTimer) clearTimeout(lapFlashTimer);
-            lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1800);
-          }
-        }
+        if (seed !== currentSeed) applyMaze(seed);
       }),
 
       subscribeToShortcut(roomId, (s) => { shortcutState = s; }),
@@ -621,9 +710,10 @@
       subscribeToMazeGrid(roomId, (b64) => {
         if (b64 && cellGrid) {
           cellGrid.walls = deserializeWalls(b64);
+          mazeLayerDirty = true; // host pushed new walls
           for (const s of botAIStates.values()) s.path = null;
           // Delay clearing evolved markers so flash is visible for ~1s
-          setTimeout(() => { if (cellGrid) cellGrid.evolved.fill(0); }, 900);
+          setTimeout(() => { if (cellGrid) { cellGrid.evolved.fill(0); mazeLayerDirty = true; } }, 900);
         }
       }),
 
@@ -662,6 +752,9 @@
         (pl) => pl.inputSource === 'bot' && pl.id !== playerId && !pl.finishedAt,
       );
 
+      // Collect every bot's new position and flush as ONE write at the end.
+      const botWrites: { id: string; x: number; y: number; progress: number }[] = [];
+
       for (const bot of bots) {
         let state = botAIStates.get(bot.id);
         if (!state) continue;
@@ -670,17 +763,31 @@
         const hx = activeMaze.hole.x, hy = activeMaze.hole.y;
         const sx = activeMaze.startPosition.x, sy = activeMaze.startPosition.y;
         const dpx = state.physics.x - sx, dpy = state.physics.y - sy;
-        const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2);
+        const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2) || 1; // avoid /0
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
         const dHx = state.physics.x - hx, dHy = state.physics.y - hy;
 
-        // Reached hole? → bot wins the lap (endless morph). Don't delete the
-        // bot state; the maze regen broadcast resets all bots to start.
+        // Reached hole? → ALWAYS score this bot's lap and reset only it (so it
+        // doesn't camp the hole). The first finisher of the round also advances
+        // the maze for everyone (gated); applyMaze then resets all racers.
         if (Math.sqrt(dHx * dHx + dHy * dHy) < activeMaze.hole.radius - 6) {
+          scoreLap(roomId, bot.id).catch(console.error);
           if (!lapWinSent) {
             lapWinSent = true;
-            winLap(roomId, bot.id, currentLap, nowMs).catch(console.error);
+            advanceMaze(roomId).catch(console.error);
+            lapFlash = 'New maze!';
+            if (lapFlashTimer) clearTimeout(lapFlashTimer);
+            lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
           }
+          state = {
+            ...state,
+            physics: { x: sx, y: sy, vx: 0, vy: 0 },
+            path: null,
+            waypointIdx: 0,
+            lastProgress: 0,
+            lastProgressTime: nowMs,
+          };
+          botAIStates.set(bot.id, state);
           continue;
         }
 
@@ -759,9 +866,12 @@
         // Bot deposits pheromone
         depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.1);
 
-        await updatePlayerPosition(roomId, bot.id, state.physics.x, state.physics.y, progress).catch(console.error);
+        botWrites.push({ id: bot.id, x: state.physics.x, y: state.physics.y, progress });
         botAIStates.set(bot.id, state);
       }
+
+      // One batched RTDB write for all bots → one echo, no event-loop backup.
+      updateBotPositions(roomId, botWrites).catch(console.error);
     }, 50);
     cleanupFns.push(() => clearInterval(botDriverId));
 
@@ -783,7 +893,7 @@
     bind:this={canvas}
     width={CANVAS_WIDTH}
     height={CANVAS_HEIGHT}
-    style="max-width: 100%; display: block; margin: 0 auto;"
+    style="width: 100%; height: auto; display: block; margin: 0 auto;"
   />
   {#if lapFlash}
     <div class="lap-banner">{lapFlash}</div>
@@ -797,9 +907,11 @@
 <style>
   .game-container {
     position: relative;
-    display: inline-block;
-    width: 100%;
-    max-width: 800px;
+    /* As large as the screen allows while keeping the whole 4:3 maze on screen:
+       width can't exceed the viewport, nor the width that would make the 0.75×
+       height taller than the viewport (≈133vh). Capped for ultra-wide. */
+    width: min(98vw, 130vh);
+    max-width: 1400px;
   }
 
   canvas {

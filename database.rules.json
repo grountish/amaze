@@ -6,7 +6,7 @@
         ".write": "auth != null",
         "players": {
           "$playerId": {
-            ".write": "auth != null && auth.uid === $playerId"
+            ".write": "auth != null && (auth.uid === $playerId || $playerId.beginsWith('bot_'))"
           }
         },
         "events": {

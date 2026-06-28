@@ -9,6 +9,7 @@ import {
   onValue,
   onDisconnect,
   runTransaction,
+  increment,
 } from "firebase/database";
 import { getFirebaseApp } from "./app";
 import { getCurrentUser } from "./auth";
@@ -177,13 +178,23 @@ function isFresh(p: Player, now: number): boolean {
   return now - (p.lastSeenAt ?? 0) < STALE_MS;
 }
 
+// A real player record has its core fields. Partial nodes can appear when the
+// presence heartbeat recreates a path that was wiped (e.g. another client
+// after "Restart for all"), leaving just { lastSeenAt } — those must be
+// dropped or the renderer crashes on the missing id.
+function isValidPlayer(p: Player | null | undefined): p is Player {
+  return !!p && typeof p.id === "string" && typeof p.inputSource === "string";
+}
+
 export function subscribeToPlayers(roomId: string, callback: (players: Player[]) => void): () => void {
   const playersRef = ref(db(), `rooms/${roomId}/players`);
   const unsub = onValue(playersRef, (snapshot) => {
     if (!snapshot.exists()) { callback([]); return; }
     const data = snapshot.val() as Record<string, Player>;
     const now = Date.now();
-    callback(Object.values(data).filter((p) => isFresh(p, now)));
+    // Derive id from the key so a record missing the field is still usable.
+    const list = Object.entries(data).map(([id, p]) => ({ ...p, id }));
+    callback(list.filter((p) => isValidPlayer(p) && isFresh(p, now)));
   });
   return unsub;
 }
@@ -198,7 +209,8 @@ export async function pruneStalePlayers(roomId: string): Promise<void> {
   const now = Date.now();
   const updates: Record<string, null> = {};
   for (const [id, p] of Object.entries(data)) {
-    if (!isFresh(p, now)) updates[id] = null;
+    // Drop stale ghosts and malformed partial records alike.
+    if (!isValidPlayer({ ...p, id }) || !isFresh(p, now)) updates[id] = null;
   }
   if (Object.keys(updates).length > 0) await update(playersRef, updates);
 }
@@ -234,12 +246,37 @@ export async function updatePlayerPosition(
   y: number,
   progress: number,
 ): Promise<void> {
+  // RTDB rejects NaN/Infinity — never write a corrupted position.
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  const prog = Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : 0;
   await update(ref(db(), `rooms/${roomId}/players/${playerId}`), {
     x: Math.round(x),
     y: Math.round(y),
-    progress,
+    progress: prog,
     lastSeenAt: Date.now(),
   });
+}
+
+// Batch every bot's position into ONE multi-path update. The old code awaited a
+// separate write per bot inside a 20Hz loop — N serial round-trips per tick that
+// backed up the event loop and fired N subscribeToPlayers re-renders. One write
+// → one echo, regardless of bot count.
+export async function updateBotPositions(
+  roomId: string,
+  updates: { id: string; x: number; y: number; progress: number }[],
+): Promise<void> {
+  if (updates.length === 0) return;
+  const now = Date.now();
+  const payload: Record<string, number> = {};
+  for (const u of updates) {
+    if (!Number.isFinite(u.x) || !Number.isFinite(u.y)) continue;
+    const prog = Number.isFinite(u.progress) ? Math.max(0, Math.min(100, u.progress)) : 0;
+    payload[`${u.id}/x`] = Math.round(u.x);
+    payload[`${u.id}/y`] = Math.round(u.y);
+    payload[`${u.id}/progress`] = prog;
+    payload[`${u.id}/lastSeenAt`] = now;
+  }
+  await update(ref(db(), `rooms/${roomId}/players`), payload);
 }
 
 export async function sendGameEvent(roomId: string, event: GameEvent): Promise<void> {
@@ -260,45 +297,31 @@ export async function finishPlayer(roomId: string, playerId: string, timeMs: num
   await sendGameEvent(roomId, { type: "GOAL_REACHED", playerId, timeMs, createdAt: now });
 }
 
-// ── Endless morph: win a lap → regenerate the maze for everyone ──
-// Race-safe: a transaction on the room only advances the lap if `lapSeen`
-// still matches, so if two players reach the hole near-simultaneously only
-// the first registers the win. Returns true if THIS caller won the lap.
-export async function winLap(
-  roomId: string,
-  playerId: string,
-  lapSeen: number,
-  nowMs: number,
-): Promise<boolean> {
-  const roomRef = ref(db(), `rooms/${roomId}`);
-  const result = await runTransaction(roomRef, (room: Room | null) => {
-    if (!room) return room;
-    const curLap = room.lap ?? 0;
-    if (curLap !== lapSeen) return room; // someone already won this lap
-    const seed = parseInt(room.mazeId, 10) || 1;
-    room.lap = curLap + 1;
-    room.mazeId = String(nextSeed(seed));
-    room.lastWinnerId = playerId;
-    room.winnerId = playerId;
-    room.lapAt = nowMs;
-    room.mazeGrid = null as unknown as undefined; // drop evolved deltas; fresh maze
-    return room;
-  });
-
-  const snap = result.snapshot.val() as Room | null;
-  const iWon = result.committed && snap?.lap === lapSeen + 1 && snap?.lastWinnerId === playerId;
-
-  if (iWon) {
-    // Increment the winner's score (separate path, own transaction).
-    const scoreRef = ref(db(), `rooms/${roomId}/players/${playerId}/score`);
-    await runTransaction(scoreRef, (s: number | null) => (s ?? 0) + 1);
-    await sendGameEvent(roomId, { type: "GOAL_REACHED", playerId, timeMs: 0, createdAt: nowMs });
-  }
-  return !!iWon;
-}
-
 export async function setRoomStatus(roomId: string, status: Room["status"]): Promise<void> {
   await update(ref(db(), `rooms/${roomId}`), { status });
+}
+
+// Personal lap: a racer reached their own goal. Atomically bump only their
+// score. Uses increment() rather than a transaction — a transaction here locks
+// the player node and collides with the constant position updates (which write
+// the same subtree), throwing "set" via repoAbortTransactions.
+export async function scoreLap(roomId: string, playerId: string): Promise<void> {
+  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { score: increment(1) });
+}
+
+// Advance to a fresh maze for everyone. The first finisher of a lap triggers
+// this; the shared seed changes → every client regenerates the same maze.
+// Writes individual leaf fields (NOT a room-node transaction) so it never
+// aborts the trap/nutrient/position writes happening on sibling subtrees.
+export async function advanceMaze(roomId: string): Promise<void> {
+  const base = `rooms/${roomId}`;
+  const snap = await get(ref(db(), `${base}/mazeId`));
+  const seed = parseInt(snap.val() ?? "1", 10) || 1;
+  await Promise.all([
+    set(ref(db(), `${base}/mazeId`), String(nextSeed(seed))),
+    set(ref(db(), `${base}/lap`), increment(1)),
+    set(ref(db(), `${base}/mazeGrid`), null), // drop evolved deltas; fresh maze
+  ]);
 }
 
 // Flip to playing AND stamp startedAt so the in-game timer actually starts.
@@ -312,7 +335,8 @@ export async function leaveRoom(roomId: string, playerId: string): Promise<void>
 }
 
 export async function addBotPlayer(roomId: string): Promise<string> {
-  const botId = `bot_${Date.now()}`;
+  // Random suffix so a tight add-loop can't collide on Date.now() (same ms).
+  const botId = `bot_${Date.now()}_${Math.floor(Math.random() * 1e9)}`;
   const now = Date.now();
   const botData: Player = {
     id: botId,
@@ -327,10 +351,33 @@ export async function addBotPlayer(roomId: string): Promise<string> {
   return botId;
 }
 
+// Reconcile the room's bot count to exactly `target` (0 = no bots): add bots
+// if short, remove extras if over. Lets a single number input drive bots
+// directly, no separate "add" action.
+export async function setBotCount(roomId: string, target: number): Promise<void> {
+  const n = Math.max(0, Math.min(50, Math.floor(target) || 0));
+  const playersRef = ref(db(), `rooms/${roomId}/players`);
+  const snap = await get(playersRef);
+  const data = (snap.val() ?? {}) as Record<string, Player>;
+  const botIds = Object.entries(data)
+    .filter(([, p]) => p.inputSource === "bot")
+    .map(([id]) => id);
+
+  if (botIds.length < n) {
+    for (let i = botIds.length; i < n; i++) await addBotPlayer(roomId);
+  } else if (botIds.length > n) {
+    const updates: Record<string, null> = {};
+    for (const id of botIds.slice(n)) updates[id] = null;
+    await update(playersRef, updates);
+  }
+}
+
 // ── Evolving maze grid ─────────────────────────────────────────
 
 export async function updateMazeGrid(roomId: string, wallsB64: string): Promise<void> {
-  await update(ref(db(), `rooms/${roomId}`), { mazeGrid: wallsB64 });
+  // Leaf write — a room-node update would abort in-flight trap/nutrient/score
+  // transactions on sibling subtrees ("set" error).
+  await set(ref(db(), `rooms/${roomId}/mazeGrid`), wallsB64);
 }
 
 export function subscribeToMazeGrid(
@@ -396,12 +443,12 @@ export function subscribeToNutrients(
 
 import type { TrapData } from './types';
 
-export async function addTrap(roomId: string, col: number, row: number): Promise<void> {
+export async function addTrap(roomId: string, col: number, row: number, armAt: number): Promise<void> {
   const trapsRef = ref(db(), `rooms/${roomId}/traps`);
   const snap = await get(trapsRef);
   const existing: Record<string, TrapData> = snap.val() ?? {};
   if (Object.keys(existing).length >= 8) return; // cap at 8
-  await update(trapsRef, { [`t_${Date.now()}`]: { col, row } });
+  await update(trapsRef, { [`t_${Date.now()}`]: { col, row, armAt } });
 }
 
 export async function triggerTrap(roomId: string, trapId: string): Promise<boolean> {

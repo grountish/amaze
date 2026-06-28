@@ -307,6 +307,11 @@ export function stepBotPhysics(
     }
   }
 
+  // Safety net: keep bots inside the maze bounds too (mirror the human clamp).
+  const maxX = GRID_COLS * CELL_SIZE - radius, maxY = GRID_ROWS * CELL_SIZE - radius;
+  x = Math.max(radius, Math.min(maxX, x));
+  y = Math.max(radius, Math.min(maxY, y));
+
   return { x, y, vx, vy };
 }
 

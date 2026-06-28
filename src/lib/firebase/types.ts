@@ -10,6 +10,7 @@ export type ShortcutState = {
 export type TrapData = {
   col: number;
   row: number;
+  armAt?: number; // epoch ms when it becomes lethal; before that it only warns
 };
 
 export type Room = {

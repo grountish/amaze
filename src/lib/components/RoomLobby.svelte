@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from "svelte";
-  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, addBotPlayer, startGame, resetRoom, joinRoom } from "$lib/firebase/rooms";
+  import { subscribeToRoom, subscribeToPlayers, setPlayerReady, setBotCount, startGame, resetRoom, joinRoom } from "$lib/firebase/rooms";
   import { setupPresence } from "$lib/firebase/presence";
   import { players, currentPlayerId } from "$lib/stores/playerStore";
   import { room } from "$lib/stores/roomStore";
@@ -17,8 +17,10 @@
   let cleanupPresence: (() => void) | null = null;
   let gameStarted = false;
   let isReady = false;
-  let botCount = 1;
-  let addingBots = false;
+  let botCount = 0;
+  let botCountInit = false; // seed the input from the room's current bots once
+  let botSyncBusy = false;
+  let botPending = false;
   let restarting = false;
   // True if a game was already in progress when we arrived — then we don't
   // auto-enter; the user explicitly chooses Join Game or Restart for all.
@@ -40,13 +42,19 @@
     await setPlayerReady(roomId, myId, isReady);
   }
 
-  async function handleAddBots() {
-    const n = Math.max(1, Math.min(50, Math.floor(botCount) || 1));
-    addingBots = true;
+  // The bot input is the source of truth: reconcile the room to its value.
+  // Coalesces rapid edits so the room converges to the latest number.
+  async function syncBots() {
+    botCount = Math.max(0, Math.min(50, Math.floor(botCount) || 0));
+    if (botSyncBusy) { botPending = true; return; }
+    botSyncBusy = true;
     try {
-      for (let i = 0; i < n; i++) await addBotPlayer(roomId);
+      do {
+        botPending = false;
+        await setBotCount(roomId, botCount);
+      } while (botPending);
     } finally {
-      addingBots = false;
+      botSyncBusy = false;
     }
   }
 
@@ -109,6 +117,8 @@
   // Humans listed individually; bots collapsed into a single anonymous count.
   $: humans = $players.filter((p) => p.inputSource !== "bot");
   $: botList = $players.filter((p) => p.inputSource === "bot");
+  // Seed the bot input from the room's current bots once (e.g. rejoining).
+  $: if (!botCountInit && $players.length > 0) { botCount = botList.length; botCountInit = true; }
 </script>
 
 <div class="lobby">
@@ -147,17 +157,17 @@
       {isReady ? "Not Ready" : "Ready Up"}
     </button>
     <div class="bot-add">
+      <label class="bot-label" for="botCount">Bots</label>
       <input
+        id="botCount"
         class="bot-count"
         type="number"
-        min="1"
+        min="0"
         max="50"
         bind:value={botCount}
+        on:change={syncBots}
         aria-label="Number of bots"
       />
-      <button class="btn-bot" on:click={handleAddBots} disabled={addingBots}>
-        {addingBots ? "Adding…" : "Add Bots"}
-      </button>
     </div>
   </div>
 
@@ -300,28 +310,18 @@
     opacity: 0.9;
   }
 
-  .btn-bot {
-    padding: 0.875rem 1.25rem;
-    border: 1px solid #3a3a6a;
-    border-radius: 10px;
-    font-size: 0.875rem;
-    background: transparent;
-    color: #8888aa;
-  }
-
-  .btn-bot:hover {
-    background: #1e1e3a;
-  }
-
-  .btn-bot:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
   .bot-add {
     display: flex;
     gap: 0.5rem;
-    align-items: stretch;
+    align-items: center;
+  }
+
+  .bot-label {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #8888aa;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
   }
 
   .bot-count {

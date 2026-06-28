@@ -55,7 +55,7 @@ export function updateGame(
 function calculateProgress(position: { x: number; y: number }, maze: Maze): number {
   const dx = maze.hole.x - maze.startPosition.x;
   const dy = maze.hole.y - maze.startPosition.y;
-  const totalDistance = Math.sqrt(dx * dx + dy * dy);
+  const totalDistance = Math.sqrt(dx * dx + dy * dy) || 1; // avoid /0 → NaN
 
   const currentDx = position.x - maze.startPosition.x;
   const currentDy = position.y - maze.startPosition.y;

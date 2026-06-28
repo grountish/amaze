@@ -1,15 +1,41 @@
 import type { Maze, Wall, Vector2 } from './types';
 
-export const GRID_COLS = 40;
-export const GRID_ROWS = 30;
-export const CELL_SIZE = 20;
+export const GRID_COLS = 60;
+export const GRID_ROWS = 45;
+export const CELL_SIZE = 20; // world = 1200×900 (¾ of the 80×60 trial)
 export const EVOLUTION_INTERVAL = 1500; // ms between evolution ticks
+
+// ── Reaction–diffusion (Gray-Scott) — Turing patterns ──────────────
+// Two virtual chemicals U (substrate) and V (activator) diffuse and react.
+// In the "coral/labyrinth" regime V self-organises into branching ridges — a
+// Turing pattern. The maze evolution then grows walls along V ridges and carves
+// corridors where V thins out, so the maze drifts toward organic labyrinths.
+// Player traffic locally consumes V, so corridors open where people actually go
+// (reaction-diffusion coupled to stigmergy). Runs host-side inside evolveGrid;
+// the resulting walls are broadcast, so every client sees the same pattern.
+const RD_DU = 0.16; // U diffuses fast
+const RD_DV = 0.08; // V diffuses slow → stable stripes, not blobs
+const RD_FEED = 0.0545; // feed rate  (coral/labyrinth preset)
+const RD_KILL = 0.062; // kill rate
+const RD_STEPS = 6; // reaction substeps per evolution tick (gentler drift)
+const RD_RIDGE = 0.25; // V above this = Turing ridge → wall may grow
+const RD_GAP = 0.06; // V below this = clear gap → wall may erode
+const RD_GROW_CHANCE = 0.5; // only some ridge cells grow per tick → calmer
+// The reaction starts as a seed in the CENTRE and spreads outward. A cell only
+// follows the Turing field once the reaction front has reached it — detected by
+// the substrate U being drawn down below this level. Untouched maze far from the
+// seed is left alone, so the labyrinth grows from the middle instead of erupting
+// everywhere at once (which was impossible to play).
+const RD_ACTIVE_U = 0.8;
+const RD_SEED_RADIUS = 4; // cells — size of the initial central V blob
 
 export type CellGrid = {
   walls: Uint8Array;       // 1=wall 0=open
   pheromone: Float32Array; // 0-1, local only
   hardness: Uint8Array;    // ticks needed to erode (255=indestructible)
   evolved: Int8Array;      // +1=just opened, -1=just closed, 0=stable
+  u: Float32Array;         // Gray-Scott substrate (0-1, local only)
+  v: Float32Array;         // Gray-Scott activator — high V = Turing ridge
 };
 
 export type NutrientData = {
@@ -21,11 +47,15 @@ export type NutrientData = {
 
 export function createCellGrid(): CellGrid {
   const n = GRID_COLS * GRID_ROWS;
+  const u = new Float32Array(n);
+  u.fill(1); // substrate starts full
   return {
     walls: new Uint8Array(n),
     pheromone: new Float32Array(n),
     hardness: new Uint8Array(n),
     evolved: new Int8Array(n),
+    u,
+    v: new Float32Array(n),
   };
 }
 
@@ -70,7 +100,7 @@ export function initGridFromMaze(grid: CellGrid, maze: Maze): void {
         const i = cellIdx(c, r);
         if (grid.hardness[i] === 255) continue; // border cells: never touch
         grid.walls[i] = 1;
-        grid.hardness[i] = 1; // start at 1 — erodes after 2 ticks (~6s)
+        grid.hardness[i] = 2; // tougher — needs sustained traffic to erode open
       }
     }
   }
@@ -78,6 +108,23 @@ export function initGridFromMaze(grid: CellGrid, maze: Maze): void {
   // Clear start + hole zones — always passable
   clearZone(grid, maze.startPosition, 30);
   clearZone(grid, { x: maze.hole.x, y: maze.hole.y }, maze.hole.radius + 10);
+
+  // Seed the Turing field as a single blob in the CENTRE of the maze. U is the
+  // full substrate everywhere; V exists only at the centre. Gray-Scott then
+  // grows the labyrinth outward from there, so the pattern starts contained and
+  // spreads — rather than filling the whole maze instantly (unplayable).
+  grid.u.fill(1);
+  grid.v.fill(0);
+  const ccx = Math.floor(GRID_COLS / 2);
+  const ccy = Math.floor(GRID_ROWS / 2);
+  for (let dr = -RD_SEED_RADIUS; dr <= RD_SEED_RADIUS; dr++) {
+    for (let dc = -RD_SEED_RADIUS; dc <= RD_SEED_RADIUS; dc++) {
+      if (dc * dc + dr * dr > RD_SEED_RADIUS * RD_SEED_RADIUS) continue;
+      const c = ccx + dc, r = ccy + dr;
+      if (c < 1 || c >= GRID_COLS - 1 || r < 1 || r >= GRID_ROWS - 1) continue;
+      grid.v[cellIdx(c, r)] = 0.6 + Math.random() * 0.2;
+    }
+  }
 }
 
 function clearZone(grid: CellGrid, center: Vector2, radius: number): void {
@@ -88,6 +135,9 @@ function clearZone(grid: CellGrid, center: Vector2, radius: number): void {
   for (let r = r0; r <= r1; r++) {
     for (let c = c0; c <= c1; c++) {
       if (c < 0 || c >= GRID_COLS || r < 0 || r >= GRID_ROWS) continue;
+      // Never open the outer border — a start/hole near an edge would punch a
+      // gap and let the ball escape off-screen.
+      if (c === 0 || c === GRID_COLS - 1 || r === 0 || r === GRID_ROWS - 1) continue;
       grid.walls[cellIdx(c, r)] = 0;
       grid.hardness[cellIdx(c, r)] = 0;
     }
@@ -190,7 +240,58 @@ function isReachableFromStart(walls: Uint8Array, maze: Maze): boolean {
   return false;
 }
 
+// 9-point discrete Laplacian (Gray-Scott standard kernel). Caller guarantees
+// (c,r) is interior, so all eight neighbours exist.
+function laplacian(f: Float32Array, c: number, r: number): number {
+  const i = r * GRID_COLS + c;
+  return (
+    f[i] * -1 +
+    (f[i - 1] + f[i + 1] + f[i - GRID_COLS] + f[i + GRID_COLS]) * 0.2 +
+    (f[i - GRID_COLS - 1] + f[i - GRID_COLS + 1] + f[i + GRID_COLS - 1] + f[i + GRID_COLS + 1]) * 0.05
+  );
+}
+
+// Advance the Gray-Scott reaction–diffusion field a few substeps. V grows into
+// Turing ridges; player pheromone consumes V so trafficked cells thin toward
+// gaps. Borders are left untouched (they stay solid wall regardless).
+// Persistent scratch buffers so reactionDiffuse doesn't allocate two
+// Float32Array(GRID_COLS*GRID_ROWS) on every call (4× bigger since the maze
+// doubled — that was a GC spike every evolution tick).
+let _rdU2: Float32Array | null = null;
+let _rdV2: Float32Array | null = null;
+
+export function reactionDiffuse(grid: CellGrid): void {
+  const { u, v, pheromone } = grid;
+  const n = GRID_COLS * GRID_ROWS;
+  if (!_rdU2 || _rdU2.length !== n) {
+    _rdU2 = new Float32Array(n);
+    _rdV2 = new Float32Array(n);
+  }
+  const u2 = _rdU2!, v2 = _rdV2!;
+  u2.set(u); // seed borders + current state (interior gets overwritten below)
+  v2.set(v);
+  for (let s = 0; s < RD_STEPS; s++) {
+    for (let r = 1; r < GRID_ROWS - 1; r++) {
+      for (let c = 1; c < GRID_COLS - 1; c++) {
+        const i = cellIdx(c, r);
+        const uvv = u[i] * v[i] * v[i];
+        let nu = u[i] + (RD_DU * laplacian(u, c, r) - uvv + RD_FEED * (1 - u[i]));
+        // Traffic eats the activator → ridges dissolve into corridors where
+        // players travel (reaction-diffusion meets stigmergy).
+        let nv = v[i] + (RD_DV * laplacian(v, c, r) + uvv - (RD_FEED + RD_KILL) * v[i]) - pheromone[i] * 0.05;
+        u2[i] = nu < 0 ? 0 : nu > 1 ? 1 : nu;
+        v2[i] = nv < 0 ? 0 : nv > 1 ? 1 : nv;
+      }
+    }
+    u.set(u2);
+    v.set(v2);
+  }
+}
+
 export function evolveGrid(grid: CellGrid, maze: Maze): void {
+  reactionDiffuse(grid); // advance the Turing field first (host-only: only the
+  // host calls evolveGrid, and the field is no longer rendered, so no need to
+  // run it on every client anymore).
   const newWalls = new Uint8Array(grid.walls);
   grid.evolved.fill(0);
 
@@ -204,12 +305,18 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
       if (isProtected(c, r, maze)) { newWalls[i] = 0; grid.hardness[i] = 0; continue; }
 
       const ph = grid.pheromone[i];
+      const vv = grid.v[i];
+      // "Active" = the reaction front has reached this cell (substrate drawn
+      // down). Only inside this expanding central region does the Turing field
+      // reshape the maze; everywhere else the original maze is left intact.
+      const active = grid.u[i] < RD_ACTIVE_U;
       const isWall = grid.walls[i] === 1;
 
       if (isWall) {
-        // Erosion: traffic wears down hardness then opens the cell. Lower
-        // threshold so corridors players actually use wear open into shortcuts.
-        if (ph > 0.1) {
+        // Erosion: walls wear open under heavy traffic anywhere, OR in a Turing
+        // gap but only inside the active region. Hardness still gates so the
+        // maze doesn't dissolve instantly.
+        if (ph > 0.22 || (active && vv < RD_GAP)) {
           if (hard > 0) {
             grid.hardness[i] = hard - 1;
           } else {
@@ -218,11 +325,17 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
           }
         }
       } else {
-        // Overgrowth: neglected open cells regrow walls, so abandoned routes
-        // close back up and the maze keeps reshaping (not just opening).
-        if (ph < 0.03) {
+        // Inside the active region, walls regrow along Turing ridges (V crests),
+        // branching into labyrinth stripes. Outside it, keep a gentle
+        // pheromone-only overgrowth so abandoned space still slowly closes. The
+        // start→hole reachability check below reverts any path-blocking regrowth.
+        if (active && vv > RD_RIDGE && ph < 0.12 && Math.random() < RD_GROW_CHANCE) {
+          newWalls[i] = 1;
+          grid.hardness[i] = 1;
+          grid.evolved[i] = -1;
+        } else if (!active && ph < 0.06) {
           const openN = countOpenNeighbors(grid.walls, c, r);
-          if (openN >= 6 && Math.random() < 0.14) {
+          if (openN >= 5 && Math.random() < 0.12) {
             newWalls[i] = 1;
             grid.hardness[i] = 1;
             grid.evolved[i] = -1;
@@ -283,10 +396,16 @@ export function getLocalWalls(grid: CellGrid, ballX: number, ballY: number): Wal
 }
 
 // Pick a cell suitable for a trap: high pheromone, open, not protected, not too close to others
+// Min cells between a new trap and any live player. A trap must never spawn
+// on top of (or right next to) a racer — that's an unfair, invisible death.
+// It has to appear far enough away to be seen and avoided.
+const TRAP_PLAYER_CLEARANCE = 5;
+
 export function pickTrapCell(
   grid: CellGrid,
   maze: Maze,
   avoidCells: { col: number; row: number }[],
+  playerCells: { col: number; row: number }[] = [],
 ): { col: number; row: number } | null {
   const sc = Math.floor(maze.startPosition.x / CELL_SIZE);
   const sr = Math.floor(maze.startPosition.y / CELL_SIZE);
@@ -303,6 +422,13 @@ export function pickTrapCell(
       // Keep clear of start and hole
       if (Math.abs(c - sc) <= 3 && Math.abs(r - sr) <= 3) continue;
       if (Math.abs(c - hc) <= 3 && Math.abs(r - hr) <= 3) continue;
+      // Keep well clear of any live player — no spawning under someone.
+      const nearPlayer = playerCells.some(
+        (p) =>
+          Math.abs(p.col - c) <= TRAP_PLAYER_CLEARANCE &&
+          Math.abs(p.row - r) <= TRAP_PLAYER_CLEARANCE,
+      );
+      if (nearPlayer) continue;
       const ph = grid.pheromone[i];
       if (ph < 0.1) continue;
       candidates.push({ col: c, row: r, ph });
