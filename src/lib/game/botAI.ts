@@ -284,7 +284,7 @@ export function stepBotPhysics(
   grid: CellGrid,
   dt: number,
 ): BotPhysicsState {
-  const sensitivity = 380;
+  const sensitivity = 235; // matches engine.ts human accel ratio; lower = slower bots, longer matches
   const friction = 0.985;
   const radius = 9; // match ball radius (engine.ts) so bots fit same corridors
 
