@@ -20,8 +20,10 @@ export function updateGame(
 ): LocalGameState {
   if (state.status !== "playing") return state;
 
-  const sensitivity = 160 * sensitivityMul; // base accel; also caps top speed (~linear). Lower = calmer + longer matches.
-  const friction = 0.985;
+  // friction sets glide ("ice") — lower = snappier stop. sensitivity is raised to
+  // keep the same low top speed (top speed ∝ sensitivity·f/(1−f)).
+  const sensitivity = 910 * sensitivityMul;
+  const friction = 0.92;
 
   const velocity = {
     x: (state.ball.velocity.x + gameInput.x * sensitivity * deltaTime) * friction,

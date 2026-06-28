@@ -284,8 +284,8 @@ export function stepBotPhysics(
   grid: CellGrid,
   dt: number,
 ): BotPhysicsState {
-  const sensitivity = 145; // matches engine.ts human accel ratio; lower = slower bots, longer matches
-  const friction = 0.985;
+  const sensitivity = 830; // raised to hold low top speed after friction drop (matches engine.ts)
+  const friction = 0.92; // less glide than 0.985 so bots stop snappier (no ice skating)
   const radius = 9; // match ball radius (engine.ts) so bots fit same corridors
 
   // Substep at the human ball's ~60Hz cadence. The bot driver ticks every
