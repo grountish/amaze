@@ -274,22 +274,26 @@
     if (mazeLayerDirty) { renderMazeLayer(); mazeLayerDirty = false; }
     if (mazeLayer) ctx.drawImage(mazeLayer, 0, 0);
 
-    // ── Cracks on walls I've damaged (local) — builds toward breaking ──
+    // ── Walls I've damaged fade out: each hit removes a third of opacity, so
+    // the cell vanishes (and is removed) on the third. Repaint over the cached
+    // blit — only damaged cells, so cheap.
     if (cellGrid && wallHits.size) {
-      ctx.strokeStyle = '#ffcaa0';
-      ctx.lineWidth = 1.5;
       for (const [ci, hits] of wallHits) {
         if (!cellGrid.walls[ci]) { wallHits.delete(ci); continue; }
         const cx = (ci % GRID_COLS) * CELL_SIZE;
         const cy = Math.floor(ci / GRID_COLS) * CELL_SIZE;
-        ctx.beginPath();
-        // one slash per hit landed so far
-        for (let h = 0; h < hits; h++) {
-          const off = 4 + h * 6;
-          ctx.moveTo(cx + off, cy + 3);
-          ctx.lineTo(cx + off - 4, cy + CELL_SIZE - 3);
+        // Cover the opaque cached wall with background…
+        ctx.fillStyle = '#06060f';
+        ctx.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
+        // …then redraw the wall at its remaining opacity.
+        const remaining = Math.max(0, (WALL_HP - hits) / WALL_HP);
+        if (remaining > 0) {
+          const ev = cellGrid.evolved[ci];
+          ctx.globalAlpha = remaining;
+          ctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
+          ctx.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
+          ctx.globalAlpha = 1;
         }
-        ctx.stroke();
       }
     }
 
@@ -413,15 +417,17 @@
       // Zombie bots get a blood-red look so the player can read the threat.
       const zombie = player.inputSource === 'bot' && isZombie(player.id);
       const color = zombie ? '#e0241c' : getPlayerColor(player.id);
+      // Damage = fade: each shot drops a third of opacity (1 → 2/3 → 1/3 → gone).
+      const hpFrac = Math.max(0, Math.min(1, (player.hp ?? MAX_HP) / MAX_HP));
+      ctx.globalAlpha = hpFrac;
       ctx.beginPath();
       ctx.arc(px, py, 9, 0, Math.PI * 2);
-      ctx.globalAlpha = zombie ? 0.9 : 0.7;
       ctx.fillStyle = color;
       ctx.fill();
-      ctx.globalAlpha = 1;
       ctx.strokeStyle = zombie ? '#6e0a06' : color;
       ctx.lineWidth = 2;
       ctx.stroke();
+      ctx.globalAlpha = 1;
       // Label human opponents only — bots are anonymous (no name/gen text)
       if (player.inputSource !== 'bot') {
         ctx.globalAlpha = 0.85;
@@ -433,10 +439,12 @@
       }
     }
 
-    // Draw local player marble: white with shadow
+    // Draw local player marble: white, fading by my own hp (each hit -1/3).
     if (gameState) {
       const { position, radius } = gameState.ball;
+      const myHp = allPlayers.find((p) => p.id === playerId)?.hp ?? MAX_HP;
       ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, myHp / MAX_HP));
       ctx.beginPath();
       ctx.arc(position.x, position.y, radius, 0, Math.PI * 2);
       ctx.fillStyle = '#ffffff';
@@ -454,23 +462,6 @@
       ctx.fill();
     }
 
-    // ── Health pips above each racer with < full hp ────────────
-    for (const pl of allPlayers) {
-      const hp = pl.hp ?? MAX_HP;
-      if (hp >= MAX_HP || hp < 0) continue;
-      let px: number, py: number;
-      if (pl.id === playerId && gameState) {
-        px = gameState.ball.position.x; py = gameState.ball.position.y;
-      } else {
-        const dp = opponentDisplayPos.get(pl.id);
-        if (!dp) continue;
-        px = dp.x; py = dp.y;
-      }
-      for (let h = 0; h < MAX_HP; h++) {
-        ctx.fillStyle = h < hp ? '#44dd66' : '#552222';
-        ctx.fillRect(px - 9 + h * 7, py - 20, 5, 3);
-      }
-    }
 
     // Back to screen space for the HUD / overlays (no camera transform).
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -685,7 +676,7 @@
                 mazeLayerDirty = true;
                 updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
               } else {
-                wallHits.set(ci, hits); // crack overlay shows the progress
+                wallHits.set(ci, hits); // fades the cell a third per hit
               }
               consumedShots.add(id); toPrune.push(id);
               continue;
