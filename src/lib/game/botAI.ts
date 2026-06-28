@@ -2,6 +2,7 @@ import {
   cellIdx,
   posToCell,
   getLocalWalls,
+  TERRAIN,
   GRID_COLS,
   GRID_ROWS,
   CELL_SIZE,
@@ -163,7 +164,11 @@ export function bfsPath(
       // Nudge the planner to prefer confirmed-open cells over guessing through
       // fog, without refusing to explore when that's the only way forward.
       const fogCost = known && !known[ni] ? 0.5 : 0;
-      const stepCost = 1 + fogCost + (hazard ? hazard[ni] : 0);
+      // Water drowns a bot, so route around it — high cost, not infinite, so a
+      // path is still found (and the carved dry route is always cheaper) instead
+      // of returning null and leaving the bot stranded.
+      const waterCost = grid.terrain[ni] === TERRAIN.WATER ? 40 : 0;
+      const stepCost = 1 + fogCost + waterCost + (hazard ? hazard[ni] : 0);
       const nd = dist[curr] + stepCost;
       if (nd < dist[ni]) {
         dist[ni] = nd;

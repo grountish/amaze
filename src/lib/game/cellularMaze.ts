@@ -135,6 +135,44 @@ export function paintTerrain(grid: CellGrid, seed: number, theme: Theme, maze: M
   // Keep a safe plain ring around both bases so nobody spawns into a hazard.
   clearTerrainAround(grid, maze.startPosition.x, maze.startPosition.y, 3);
   clearTerrainAround(grid, maze.hole.x, maze.hole.y, 2);
+
+  // Guarantee a fully-dry route start↔hole so water can never seal the only
+  // path (which would hard-block a raft-less human and drown-loop the bots).
+  carveDryPath(grid, maze);
+}
+
+// BFS the shortest floor path start→hole and strip terrain off it, so there is
+// always at least one hazard-free corridor through the maze. Deterministic.
+function carveDryPath(grid: CellGrid, maze: Maze): void {
+  const n = GRID_COLS * GRID_ROWS;
+  const sc = Math.floor(maze.startPosition.x / CELL_SIZE);
+  const sr = Math.floor(maze.startPosition.y / CELL_SIZE);
+  const gc = Math.floor(maze.hole.x / CELL_SIZE);
+  const gr = Math.floor(maze.hole.y / CELL_SIZE);
+  const si = cellIdx(sc, sr), gi = cellIdx(gc, gr);
+
+  const parent = new Int32Array(n).fill(-1);
+  const seen = new Uint8Array(n);
+  const queue = new Int32Array(n);
+  let head = 0, tail = 0;
+  queue[tail++] = si; seen[si] = 1;
+
+  while (head < tail) {
+    const cur = queue[head++];
+    if (cur === gi) break;
+    const c = cur % GRID_COLS, r = (cur / GRID_COLS) | 0;
+    for (let d = 0; d < 4; d++) {
+      const nc = c + (d === 0 ? 1 : d === 1 ? -1 : 0);
+      const nr = r + (d === 2 ? 1 : d === 3 ? -1 : 0);
+      if (nc < 0 || nc >= GRID_COLS || nr < 0 || nr >= GRID_ROWS) continue;
+      const ni = cellIdx(nc, nr);
+      if (seen[ni] || grid.walls[ni]) continue;
+      seen[ni] = 1; parent[ni] = cur; queue[tail++] = ni;
+    }
+  }
+
+  if (!seen[gi]) return; // disconnected maze (shouldn't happen) — nothing to carve
+  for (let idx = gi; idx !== -1; idx = parent[idx]) grid.terrain[idx] = TERRAIN.NONE;
 }
 
 function clearTerrainAround(grid: CellGrid, x: number, y: number, rad: number): void {
