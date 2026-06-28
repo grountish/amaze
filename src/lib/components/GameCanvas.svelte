@@ -123,6 +123,15 @@
     return PLAYER_COLORS[Math.abs(hash) % PLAYER_COLORS.length];
   }
 
+  // Battle roles: ~half the bots are "zombies" that hunt the human instead of
+  // racing. Derived purely from the bot id (hash parity) so the host AI and
+  // every client agree with zero extra network — no stored role field.
+  function isZombie(id: string): boolean {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) & 0xffffffff;
+    return (Math.abs(hash) & 1) === 0;
+  }
+
   // Current position of a shot, derived purely from how long it's been alive.
   function shotXY(s: ShotData, nowMs: number): { x: number; y: number; age: number } {
     const age = (nowMs - s.firedAt) / 1000;
@@ -345,14 +354,16 @@
       const py = prev.y + (targetY - prev.y) * lerpFactor;
       opponentDisplayPos.set(player.id, { x: px, y: py });
 
-      const color = getPlayerColor(player.id);
+      // Zombie bots get a sickly-green look so the player can read the threat.
+      const zombie = player.inputSource === 'bot' && isZombie(player.id);
+      const color = zombie ? '#5bd11a' : getPlayerColor(player.id);
       ctx.beginPath();
       ctx.arc(px, py, 9, 0, Math.PI * 2);
-      ctx.globalAlpha = 0.7;
+      ctx.globalAlpha = zombie ? 0.85 : 0.7;
       ctx.fillStyle = color;
       ctx.fill();
       ctx.globalAlpha = 1;
-      ctx.strokeStyle = color;
+      ctx.strokeStyle = zombie ? '#2e6b0c' : color;
       ctx.lineWidth = 2;
       ctx.stroke();
       // Label human opponents only — bots are anonymous (no name/gen text)
@@ -677,6 +688,27 @@
         setPlayerHp(roomId, playerId, MAX_HP).catch(console.error);
       }
 
+      // ── Zombie contact: a hunting bot that touches me is instant death.
+      // Self-authoritative (uses my real ball position), so it fires for every
+      // human regardless of who hosts the bot AI. Respawn at start.
+      if (gameState.status === 'playing') {
+        const bx = gameState.ball.position.x, by = gameState.ball.position.y;
+        const reach = gameState.ball.radius + 9;
+        for (const pl of get(players)) {
+          if (pl.inputSource !== 'bot' || pl.x == null || pl.y == null || !isZombie(pl.id)) continue;
+          const ddx = pl.x - bx, ddy = pl.y - by;
+          if (ddx * ddx + ddy * ddy < reach * reach) {
+            deathFlashUntil = nowMs + 800;
+            gameState = {
+              ...gameState,
+              ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
+              progress: 0,
+            };
+            break;
+          }
+        }
+      }
+
       // Build physics walls from grid + optional shortcut collapse
       const shortcutCollapsed =
         activeMaze.shortcut != null &&
@@ -934,6 +966,10 @@
       const bots = allPlayers.filter(
         (pl) => pl.inputSource === 'bot' && pl.id !== playerId && !pl.finishedAt,
       );
+      // Live human targets for zombie bots (cheap: usually 1-2 players).
+      const humans = allPlayers.filter(
+        (pl) => pl.inputSource !== 'bot' && pl.x != null && pl.y != null && !pl.finishedAt,
+      );
 
       // Collect every bot's new position and flush as ONE write at the end.
       const botWrites: { id: string; x: number; y: number; progress: number }[] = [];
@@ -944,6 +980,18 @@
 
         const hx = activeMaze.hole.x, hy = activeMaze.hole.y;
         const sx = activeMaze.startPosition.x, sy = activeMaze.startPosition.y;
+
+        // Zombies hunt the nearest live human; racers head for the human's start.
+        const zombie = isZombie(bot.id);
+        let goalX = sx, goalY = sy;
+        if (zombie && humans.length) {
+          let best = Infinity;
+          for (const h of humans) {
+            const ddx = h.x! - state.physics.x, ddy = h.y! - state.physics.y;
+            const d = ddx * ddx + ddy * ddy;
+            if (d < best) { best = d; goalX = h.x!; goalY = h.y!; }
+          }
+        }
 
         // Shot down (hp ran out) → respawn at start with fresh hp.
         if (bot.hp != null && bot.hp <= 0) {
@@ -963,7 +1011,8 @@
 
         // Reached the human's start? → score this bot and reset only it. The
         // first finisher of the round also advances the maze for everyone (gated).
-        if (Math.sqrt(dGx * dGx + dGy * dGy) < 16) {
+        // Zombies never "win" the race — they only hunt, so they skip this.
+        if (!zombie && Math.sqrt(dGx * dGx + dGy * dGy) < 16) {
           scoreLap(roomId, bot.id).catch(console.error);
           if (!lapWinSent) {
             lapWinSent = true;
@@ -1041,7 +1090,7 @@
         // react to walls it just discovered through the fog. Hazard map steers
         // around past deaths; known map gates what counts as a wall.
         if (!state.path || nowMs >= state.replanAt) {
-          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, sx, sy, state.hazard, state.known);
+          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, goalX, goalY, state.hazard, state.known);
           state.waypointIdx = 0;
           state.replanAt = nowMs + 600;
         }
