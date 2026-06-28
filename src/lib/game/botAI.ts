@@ -185,6 +185,28 @@ export function bfsPath(
   return full.filter((_, i) => i % 2 === 0 || i === full.length - 1);
 }
 
+// Clear line of sight between two world points? Samples the segment every
+// half-cell and fails on the first wall hit. Cheap raycast for zombie "sight"
+// — callers cap the range so the sample count stays small.
+export function hasLineOfSight(
+  grid: CellGrid,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+): boolean {
+  const dx = x1 - x0, dy = y1 - y0;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const steps = Math.ceil(dist / (CELL_SIZE * 0.5));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const { col, row } = posToCell(x0 + dx * t, y0 + dy * t);
+    if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) return false;
+    if (grid.walls[cellIdx(col, row)]) return false;
+  }
+  return true;
+}
+
 // ── Movement input ─────────────────────────────────────────────
 
 export function computeBotInput(

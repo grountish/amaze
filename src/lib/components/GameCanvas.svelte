@@ -16,7 +16,7 @@
   import type { InputSource, ShortcutState, TrapData, ShotData } from '$lib/firebase/types';
   import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
   import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
-  import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround } from '$lib/game/botAI';
+  import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround, hasLineOfSight } from '$lib/game/botAI';
   import type { BotGenome, BotPhysicsState, GridPath } from '$lib/game/botAI';
 
   export let roomId: string;
@@ -111,6 +111,16 @@
     replanAt: number;     // next time this bot may recompute its path
   };
   const botAIStates = new Map<string, BotAIState>();
+
+  // Zombies don't wander: pure path-follow, no pheromone drift, no random
+  // deviation — a relentless beeline toward the prey.
+  const ZOMBIE_GENOME: BotGenome = {
+    pathWeight: 1, pheroWeight: 0, exploreRate: 0,
+    generation: 1, deaths: 0, bestProgress: 0,
+  };
+  // Last-seen human positions + smoothed velocity (id → …) so zombies can lead
+  // the target instead of chasing where it already left.
+  const humanTrack = new Map<string, { x: number; y: number; t: number; vx: number; vy: number }>();
   let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
 
@@ -354,16 +364,16 @@
       const py = prev.y + (targetY - prev.y) * lerpFactor;
       opponentDisplayPos.set(player.id, { x: px, y: py });
 
-      // Zombie bots get a sickly-green look so the player can read the threat.
+      // Zombie bots get a blood-red look so the player can read the threat.
       const zombie = player.inputSource === 'bot' && isZombie(player.id);
-      const color = zombie ? '#5bd11a' : getPlayerColor(player.id);
+      const color = zombie ? '#e0241c' : getPlayerColor(player.id);
       ctx.beginPath();
       ctx.arc(px, py, 9, 0, Math.PI * 2);
-      ctx.globalAlpha = zombie ? 0.85 : 0.7;
+      ctx.globalAlpha = zombie ? 0.9 : 0.7;
       ctx.fillStyle = color;
       ctx.fill();
       ctx.globalAlpha = 1;
-      ctx.strokeStyle = zombie ? '#2e6b0c' : color;
+      ctx.strokeStyle = zombie ? '#6e0a06' : color;
       ctx.lineWidth = 2;
       ctx.stroke();
       // Label human opponents only — bots are anonymous (no name/gen text)
@@ -970,6 +980,18 @@
       const humans = allPlayers.filter(
         (pl) => pl.inputSource !== 'bot' && pl.x != null && pl.y != null && !pl.finishedAt,
       );
+      // Refresh velocity tracks (EMA-smoothed against the ~20fps position
+      // stream) so zombies can lead their prey rather than trail it.
+      for (const h of humans) {
+        const prev = humanTrack.get(h.id);
+        let vx = 0, vy = 0;
+        if (prev) {
+          const dtSec = Math.max(0.001, (nowMs - prev.t) / 1000);
+          vx = prev.vx * 0.6 + ((h.x! - prev.x) / dtSec) * 0.4;
+          vy = prev.vy * 0.6 + ((h.y! - prev.y) / dtSec) * 0.4;
+        }
+        humanTrack.set(h.id, { x: h.x!, y: h.y!, t: nowMs, vx, vy });
+      }
 
       // Collect every bot's new position and flush as ONE write at the end.
       const botWrites: { id: string; x: number; y: number; progress: number }[] = [];
@@ -983,14 +1005,24 @@
 
         // Zombies hunt the nearest live human; racers head for the human's start.
         const zombie = isZombie(bot.id);
-        let goalX = sx, goalY = sy;
+        let goalX = sx, goalY = sy;   // BFS goal (racer: start; zombie: lead point)
+        let preyX = 0, preyY = 0;     // nearest human's live pos (for LOS lunge)
+        let hasPrey = false;
         if (zombie && humans.length) {
-          let best = Infinity;
+          let best = Infinity, prey = humans[0];
           for (const h of humans) {
             const ddx = h.x! - state.physics.x, ddy = h.y! - state.physics.y;
             const d = ddx * ddx + ddy * ddy;
-            if (d < best) { best = d; goalX = h.x!; goalY = h.y!; }
+            if (d < best) { best = d; prey = h; }
           }
+          hasPrey = true;
+          preyX = prey.x!; preyY = prey.y!;
+          // Lead the prey: aim a short time ahead along its velocity so the
+          // zombie cuts the corner. Clamp so the planner target stays in-bounds.
+          const tr = humanTrack.get(prey.id);
+          const LEAD = 0.35; // seconds of look-ahead
+          goalX = Math.max(0, Math.min(WORLD_WIDTH - 1, preyX + (tr ? tr.vx : 0) * LEAD));
+          goalY = Math.max(0, Math.min(WORLD_HEIGHT - 1, preyY + (tr ? tr.vy : 0) * LEAD));
         }
 
         // Shot down (hp ran out) → respawn at start with fresh hp.
@@ -1086,20 +1118,37 @@
         // See what's nearby, then plan over only what's been discovered.
         revealAround(state.known, state.physics.x, state.physics.y);
 
-        // Re-plan if pathless OR the cooldown elapsed — the latter lets the bot
-        // react to walls it just discovered through the fog. Hazard map steers
-        // around past deaths; known map gates what counts as a wall.
-        if (!state.path || nowMs >= state.replanAt) {
-          state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, goalX, goalY, state.hazard, state.known);
-          state.waypointIdx = 0;
-          state.replanAt = nowMs + 600;
-        }
+        let botInput: { x: number; y: number };
 
-        // Compute input from genome + path + pheromone
-        const { input: botInput, nextWaypointIdx } = computeBotInput(
-          state.genome, state.path, state.waypointIdx, state.physics.x, state.physics.y, cellGrid,
-        );
-        state.waypointIdx = nextWaypointIdx;
+        // A zombie that can SEE its prey (clear LOS within range) lunges straight
+        // at it — no waypoints, no BFS. The range cap also bounds the raycast.
+        const lx = preyX - state.physics.x, ly = preyY - state.physics.y;
+        const LOS_RANGE = 420; // px
+        if (
+          zombie && hasPrey &&
+          lx * lx + ly * ly < LOS_RANGE * LOS_RANGE &&
+          hasLineOfSight(cellGrid, state.physics.x, state.physics.y, preyX, preyY)
+        ) {
+          const m = Math.hypot(lx, ly) || 1;
+          botInput = { x: lx / m, y: ly / m };
+          state.path = null; // out-of-sight next tick → forces a fresh plan
+        } else {
+          // Re-plan if pathless OR the cooldown elapsed — the latter lets the bot
+          // react to walls it just discovered through the fog. Hazard map steers
+          // around past deaths; known map gates what counts as a wall. Zombies
+          // replan faster (the goal moves) and run the relentless hunter genome.
+          if (!state.path || nowMs >= state.replanAt) {
+            state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, goalX, goalY, state.hazard, state.known);
+            state.waypointIdx = 0;
+            state.replanAt = nowMs + (zombie ? 400 : 600);
+          }
+          const r = computeBotInput(
+            zombie ? ZOMBIE_GENOME : state.genome,
+            state.path, state.waypointIdx, state.physics.x, state.physics.y, cellGrid,
+          );
+          botInput = r.input;
+          state.waypointIdx = r.nextWaypointIdx;
+        }
 
         // Step physics, then reveal the cells we moved into
         state.physics = stepBotPhysics(state.physics, botInput.x, botInput.y, cellGrid, botDt);
