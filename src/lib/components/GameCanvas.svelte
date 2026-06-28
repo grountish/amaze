@@ -14,8 +14,8 @@
   import { setupPresence } from '$lib/firebase/presence';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState, TrapData, ShotData } from '$lib/firebase/types';
-  import { createCellGrid, initGridFromMaze, markArmoredWalls, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
-  import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
+  import { createCellGrid, initGridFromMaze, markArmoredWalls, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, pickTheme, paintTerrain, TERRAIN, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
+  import type { CellGrid, NutrientData, Theme } from '$lib/game/cellularMaze';
   import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround, hasLineOfSight } from '$lib/game/botAI';
   import type { BotGenome, BotPhysicsState, GridPath } from '$lib/game/botAI';
 
@@ -50,6 +50,8 @@
   const BUILD_COOLDOWN = 300; // ms between placed walls
   const BOMB_COOLDOWN = 400; // ms between dropped bombs
   const BOMB_START = 3; // bombs you spawn with / a purple nutrient grants
+  const RAFT_START = 2; // rafts a cyan nutrient grants (cross water without drowning)
+  const SAND_SPEED = 0.4; // speed multiplier on sand terrain
   const MAX_HP = 3; // hits to die
   const POSITION_SYNC_THROTTLE = 50;
 
@@ -99,6 +101,9 @@
   let lastBuildAt = 0;
   let lastBombAt = 0;
   let bombCount = BOMB_START; // mines in inventory; drop with D, refill via purple nutrient
+  let rafts = 1; // water-crossing charges; +RAFT_START from a cyan nutrient
+  let onWater = false; // tracks water-cell entry transitions (drown / consume a raft)
+  let theme: Theme = pickTheme(1); // per-maze biome theme (palette + terrains); set per seed in onMount/applyMaze
   let boostLabel = ''; // speed-boost text, shown in the DOM stats panel (not over the maze)
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
@@ -292,25 +297,45 @@
     const mctx = mazeLayer.getContext('2d');
     if (!mctx) return;
 
-    mctx.fillStyle = '#06060f';
+    const pal = theme ?? pickTheme(currentSeed);
+    mctx.fillStyle = pal.bg;
     mctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
     if (cellGrid) {
-      // Wall cells
+      // One pass: wall cells get the theme wall palette; open cells with a
+      // terrain biome get the terrain fill (walls always win). Cached layer —
+      // only re-rasterised on mazeLayerDirty, so per-frame cost is zero.
       for (let r = 0; r < GRID_ROWS; r++) {
         for (let c = 0; c < GRID_COLS; c++) {
           const i = r * GRID_COLS + c;
-          if (!cellGrid.walls[i]) continue;
-          const ev = cellGrid.evolved[i];
-          mctx.fillStyle = armoredHit.has(i)
-            ? '#ff2a2a' // revealed armored wall: permanent red
-            : ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
-          mctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+          const x = c * CELL_SIZE, y = r * CELL_SIZE;
+          if (cellGrid.walls[i]) {
+            const ev = cellGrid.evolved[i];
+            mctx.fillStyle = armoredHit.has(i)
+              ? '#ff2a2a' // revealed armored wall: permanent red
+              : ev === -1 ? pal.wallClosed : ev === 1 ? pal.wallOpen : pal.wall;
+            mctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+            continue;
+          }
+          const t = cellGrid.terrain[i];
+          if (t === TERRAIN.SAND) {
+            mctx.fillStyle = '#c2a35a';
+            mctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+          } else if (t === TERRAIN.WATER) {
+            mctx.fillStyle = '#2a6abf';
+            mctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+          } else if (t === TERRAIN.FOREST) {
+            mctx.fillStyle = '#1f4a24';
+            mctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+            mctx.fillStyle = '#2f7a36'; // canopy dots → reads as tree cover
+            mctx.fillRect(x + 4, y + 4, 5, 5);
+            mctx.fillRect(x + 11, y + 10, 4, 4);
+          }
         }
       }
     } else {
       // Fallback: static walls while grid initialises
-      mctx.fillStyle = '#2e2e50';
+      mctx.fillStyle = pal.wall;
       for (const wall of activeMaze.walls) {
         mctx.fillRect(wall.x, wall.y, wall.width, wall.height);
       }
@@ -350,14 +375,14 @@
         const cx = (ci % GRID_COLS) * CELL_SIZE;
         const cy = Math.floor(ci / GRID_COLS) * CELL_SIZE;
         // Cover the opaque cached wall with background…
-        ctx.fillStyle = '#06060f';
+        ctx.fillStyle = theme.bg;
         ctx.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
         // …then redraw the wall at its remaining opacity.
         const remaining = Math.max(0, (WALL_HP - hits) / WALL_HP);
         if (remaining > 0) {
           const ev = cellGrid.evolved[ci];
           ctx.globalAlpha = remaining;
-          ctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
+          ctx.fillStyle = ev === -1 ? theme.wallClosed : ev === 1 ? theme.wallOpen : theme.wall;
           ctx.fillRect(cx, cy, CELL_SIZE, CELL_SIZE);
           ctx.globalAlpha = 1;
         }
@@ -376,6 +401,8 @@
         ctx.arc(nx, ny, 5 * pulse, 0, Math.PI * 2);
         ctx.fillStyle = n.kind === 'bomb'
           ? `rgba(190,70,255,${0.7 + 0.3 * pulse})` // purple = bomb refill
+          : n.kind === 'raft'
+          ? `rgba(60,210,230,${0.7 + 0.3 * pulse})` // cyan = raft refill
           : `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
         ctx.fill();
         ctx.restore();
@@ -674,6 +701,35 @@
       speedBoosts = speedBoosts.filter((b) => b.expires > nowMs);
       const speedFactor = speedBoosts.reduce((f, b) => f * b.factor, 1.0);
 
+      // ── Terrain (biome) effect at the ball's cell ──────────────
+      // Sand slows; water drowns unless a raft is spent. One O(1) sample/frame.
+      let terrainMul = 1;
+      if (cellGrid && gameState.status === 'playing') {
+        const bcx = Math.floor(gameState.ball.position.x / CELL_SIZE);
+        const bcy = Math.floor(gameState.ball.position.y / CELL_SIZE);
+        const terr = cellGrid.terrain[bcy * GRID_COLS + bcx];
+        if (terr === TERRAIN.SAND) terrainMul = SAND_SPEED;
+        if (terr === TERRAIN.WATER) {
+          if (!onWater) {
+            onWater = true; // entering water this frame
+            if (rafts > 0) {
+              rafts -= 1; // a raft carries you across
+            } else {
+              deathFlashUntil = nowMs + 800;
+              lapFlash = 'You drowned!';
+              if (lapFlashTimer) clearTimeout(lapFlashTimer);
+              lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
+              gameState = {
+                ...gameState,
+                ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
+              };
+            }
+          }
+        } else {
+          onWater = false;
+        }
+      }
+
       // Pheromone: deposit at local ball + all opponent positions
       if (cellGrid && gameState.status === 'playing') {
         depositPheromone(cellGrid, gameState.ball.position.x, gameState.ball.position.y);
@@ -704,9 +760,12 @@
             evolveGrid(cellGrid, activeMaze); // also advances the Turing field
             mazeLayerDirty = true; // host: walls just changed
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
-            // One of the three is a bomb refill (purple) so players can restock.
+            // Of the three: one bomb refill (purple), one raft (cyan), one speed
+            // (orange) — so players can restock both consumables.
             const candidates = findNutrientPositions(cellGrid, 3).map((c, i) =>
-              i === 0 ? { ...c, kind: 'bomb' as const } : c,
+              i === 0 ? { ...c, kind: 'bomb' as const }
+              : i === 1 ? { ...c, kind: 'raft' as const }
+              : c,
             );
             syncNutrients(roomId, candidates).catch(console.error);
 
@@ -755,6 +814,7 @@
             collectNutrient(roomId, id).then((ok) => {
               if (!ok) { collectedNutrients.delete(id); return; }
               if (n.kind === 'bomb') bombCount += BOMB_START; // purple → +3 mines
+              else if (n.kind === 'raft') rafts += RAFT_START; // cyan → +2 rafts
               else speedBoosts = [...speedBoosts, { expires: nowMs + 8000, factor: 1 + n.value * 0.2 }];
             }).catch(console.error);
           }
@@ -899,7 +959,7 @@
         localWalls.push(activeMaze.shortcut.gapWall);
       }
       const frameMaze = { ...activeMaze, walls: localWalls };
-      gameState = updateGame(gameState, frameMaze, currentInput, deltaTime, speedFactor);
+      gameState = updateGame(gameState, frameMaze, currentInput, deltaTime, speedFactor * terrainMul);
 
       // Safety net: never let the ball leave the maze bounds / go off-screen.
       {
@@ -984,8 +1044,11 @@
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     markArmoredWalls(cellGrid, seed); // deterministic per-maze armored set
+    theme = pickTheme(seed); // per-maze biome palette + terrains
+    paintTerrain(cellGrid, seed, theme, activeMaze);
     cellGrid.pheromone.fill(0);
     cellGrid.evolved.fill(0);
+    onWater = false; // fresh maze ⇒ reset water-entry tracking
     wallHits.clear(); // wall damage doesn't carry to a fresh maze
     armoredHit.clear(); // armored reveals reset on a fresh maze
     allZombies = false; // fresh maze clears rage locally (authoritative reset in advanceMaze)
@@ -1030,6 +1093,8 @@
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     markArmoredWalls(cellGrid, currentSeed); // deterministic per-maze armored set
+    theme = pickTheme(currentSeed); // per-maze biome palette + terrains
+    paintTerrain(cellGrid, currentSeed, theme, activeMaze);
 
     // Aim defaults toward the hole (snapped to cardinal) until the player moves.
     {
@@ -1275,6 +1340,28 @@
         }
         if (hitTrap) continue;
 
+        // ── Terrain at the bot's cell: water drowns it (no rafts for bots),
+        // sand will slow its step below. Emergent: bait a zombie into water.
+        const btc = Math.floor(state.physics.x / CELL_SIZE);
+        const btr = Math.floor(state.physics.y / CELL_SIZE);
+        const botTerr = cellGrid.terrain[btr * GRID_COLS + btc];
+        if (botTerr === TERRAIN.WATER) {
+          recordDeath(state.hazard, state.physics.x, state.physics.y);
+          state = {
+            genome: mutate(state.genome, progress),
+            physics: { x: hx, y: hy, vx: 0, vy: 0 },
+            path: null,
+            waypointIdx: 0,
+            lastProgress: 0,
+            lastProgressTime: nowMs,
+            hazard: state.hazard,
+            known: state.known,
+            replanAt: 0,
+          };
+          botAIStates.set(bot.id, state);
+          continue;
+        }
+
         // Stuck check
         if (progress > state.lastProgress + 2) {
           state.lastProgress = progress;
@@ -1305,10 +1392,14 @@
 
         // A zombie that can SEE its prey (clear LOS within range) lunges straight
         // at it — no waypoints, no BFS. The range cap also bounds the raycast.
+        // Forest is cover: if the prey is standing in trees, the zombie loses the
+        // lunge and falls back to planning toward its last lead point.
         const lx = preyX - state.physics.x, ly = preyY - state.physics.y;
         const LOS_RANGE = 420; // px
+        const preyHidden = hasPrey &&
+          cellGrid.terrain[Math.floor(preyY / CELL_SIZE) * GRID_COLS + Math.floor(preyX / CELL_SIZE)] === TERRAIN.FOREST;
         if (
-          zombie && hasPrey &&
+          zombie && hasPrey && !preyHidden &&
           lx * lx + ly * ly < LOS_RANGE * LOS_RANGE &&
           hasLineOfSight(cellGrid, state.physics.x, state.physics.y, preyX, preyY)
         ) {
@@ -1337,7 +1428,8 @@
         // cardinal axis (4-dir) and sign-normalize to unit so the bot keeps full
         // speed instead of crawling on a ~0.7 diagonal component.
         const bs = snapCardinal(botInput);
-        state.physics = stepBotPhysics(state.physics, Math.sign(bs.x), Math.sign(bs.y), cellGrid, botDt);
+        const botSpeedMul = botTerr === TERRAIN.SAND ? SAND_SPEED : 1; // sand slows bots too
+        state.physics = stepBotPhysics(state.physics, Math.sign(bs.x), Math.sign(bs.y), cellGrid, botDt, botSpeedMul);
         revealAround(state.known, state.physics.x, state.physics.y);
 
         // Bot deposits pheromone
@@ -1383,7 +1475,9 @@
 
 {#if inputSource !== 'bot'}
   <div class="stats-panel">
+    {#if theme}<div class="stat theme-tag">{theme.name}</div>{/if}
     <div class="stat"><span class="stat-ico">💣</span><span class="stat-val">{bombCount}</span></div>
+    <div class="stat raft"><span class="stat-ico">🛟</span><span class="stat-val">{rafts}</span></div>
     {#if boostLabel}<div class="stat boost">{boostLabel}</div>{/if}
   </div>
   <button
@@ -1504,5 +1598,12 @@
   }
   .stat-ico { font-size: 1.1rem; }
   .stat-val { font-variant-numeric: tabular-nums; }
+  .stat.raft { color: #3cd2e6; }
   .stat.boost { color: #ffd700; font-size: 0.9rem; }
+  .stat.theme-tag {
+    color: #cdd2ff;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
 </style>

@@ -35,16 +35,45 @@ export type CellGrid = {
   hardness: Uint8Array;    // ticks needed to erode (255=indestructible)
   evolved: Int8Array;      // +1=just opened, -1=just closed, 0=stable
   armored: Uint8Array;     // 1=armored wall: shot→permanent red, immune to evolution
+  terrain: Uint8Array;     // biome overlay on OPEN cells (see TERRAIN); 0=plain floor
   u: Float32Array;         // Gray-Scott substrate (0-1, local only)
   v: Float32Array;         // Gray-Scott activator — high V = Turing ridge
 };
+
+// Biome terrain painted onto open floor cells. Walls always win over terrain.
+export const TERRAIN = { NONE: 0, SAND: 1, WATER: 2, FOREST: 3 } as const;
+
+export type Theme = {
+  name: string;
+  bg: string;            // maze-layer background
+  wall: string;         // stable wall
+  wallOpen: string;     // just-opened (evolved +1)
+  wallClosed: string;   // just-closed (evolved -1)
+  terrains: number[];   // which TERRAIN ids appear (weighted by repetition)
+};
+
+// One theme per maze, chosen deterministically from the seed. Only themes whose
+// terrains are implemented (sand/water/forest) ship in v1. "Wastes" is the
+// classic look with no terrain — keeps some mazes plain.
+export const THEMES: Theme[] = [
+  { name: "Wastes", bg: "#06060f", wall: "#2e2e50", wallOpen: "#224488", wallClosed: "#882222", terrains: [] },
+  { name: "Desert", bg: "#181206", wall: "#7a5a2e", wallOpen: "#b07a3a", wallClosed: "#8a3b1e", terrains: [TERRAIN.SAND, TERRAIN.SAND, TERRAIN.SAND, TERRAIN.WATER] },
+  { name: "Swamp",  bg: "#0a140e", wall: "#2e4a36", wallOpen: "#3a6a4a", wallClosed: "#5a6a22", terrains: [TERRAIN.WATER, TERRAIN.WATER, TERRAIN.FOREST] },
+  { name: "Forest", bg: "#08130a", wall: "#2c4a2c", wallOpen: "#3f7a3f", wallClosed: "#6a5a22", terrains: [TERRAIN.FOREST, TERRAIN.FOREST, TERRAIN.WATER] },
+];
+
+export function pickTheme(seed: number): Theme {
+  let h = (seed * 2654435761) >>> 0;
+  h = (h ^ (h >>> 15)) >>> 0;
+  return THEMES[h % THEMES.length];
+}
 
 export type NutrientData = {
   col: number;
   row: number;
   value: number;   // 1-3, controls boost magnitude
   expiresAt: number;
-  kind?: "bomb";   // undefined = speed boost (orange); "bomb" = +3 bombs (purple)
+  kind?: "bomb" | "raft"; // undefined=speed (orange); bomb=+3 mines (purple); raft=+2 (cyan)
 };
 
 export function createCellGrid(): CellGrid {
@@ -57,9 +86,65 @@ export function createCellGrid(): CellGrid {
     hardness: new Uint8Array(n),
     evolved: new Int8Array(n),
     armored: new Uint8Array(n),
+    terrain: new Uint8Array(n),
     u,
     v: new Float32Array(n),
   };
+}
+
+// Paint biome terrain blobs onto OPEN cells, deterministically from the seed so
+// every client agrees (collision/drown must match). Circular blobs centred on
+// hashed cells; bases (start/hole) are kept plain so you never spawn in water.
+// Must run AFTER initGridFromMaze. Cheap: O(cells × blobs), once per maze.
+export function paintTerrain(grid: CellGrid, seed: number, theme: Theme, maze: Maze): void {
+  grid.terrain.fill(0);
+  if (theme.terrains.length === 0) return;
+
+  // Seeded xorshift (no Math.random → identical on every client).
+  let h = (seed * 374761393 + 1) >>> 0;
+  const rnd = () => {
+    h ^= h << 13; h >>>= 0;
+    h ^= h >>> 17;
+    h ^= h << 5; h >>>= 0;
+    return h / 4294967296;
+  };
+
+  const BLOBS = 9;
+  const blobs: { c: number; r: number; rad: number; t: number }[] = [];
+  for (let k = 0; k < BLOBS; k++) {
+    const t = theme.terrains[Math.floor(rnd() * theme.terrains.length)];
+    blobs.push({
+      c: 2 + Math.floor(rnd() * (GRID_COLS - 4)),
+      r: 2 + Math.floor(rnd() * (GRID_ROWS - 4)),
+      rad: 3 + rnd() * 5,
+      t,
+    });
+  }
+
+  for (let r = 1; r < GRID_ROWS - 1; r++) {
+    for (let c = 1; c < GRID_COLS - 1; c++) {
+      const i = cellIdx(c, r);
+      if (grid.walls[i]) continue; // terrain only on floor
+      for (const b of blobs) {
+        const dc = c - b.c, dr = r - b.r;
+        if (dc * dc + dr * dr <= b.rad * b.rad) { grid.terrain[i] = b.t; break; }
+      }
+    }
+  }
+
+  // Keep a safe plain ring around both bases so nobody spawns into a hazard.
+  clearTerrainAround(grid, maze.startPosition.x, maze.startPosition.y, 3);
+  clearTerrainAround(grid, maze.hole.x, maze.hole.y, 2);
+}
+
+function clearTerrainAround(grid: CellGrid, x: number, y: number, rad: number): void {
+  const cc = Math.floor(x / CELL_SIZE), cr = Math.floor(y / CELL_SIZE);
+  for (let r = cr - rad; r <= cr + rad; r++) {
+    for (let c = cc - rad; c <= cc + rad; c++) {
+      if (c < 0 || r < 0 || c >= GRID_COLS || r >= GRID_ROWS) continue;
+      grid.terrain[cellIdx(c, r)] = 0;
+    }
+  }
 }
 
 // Deterministically flag a fraction of interior wall cells as "armored". They

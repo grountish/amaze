@@ -283,8 +283,9 @@ export function stepBotPhysics(
   inputY: number,
   grid: CellGrid,
   dt: number,
+  speedMul = 1, // terrain factor (e.g. sand slows the bot like the human)
 ): BotPhysicsState {
-  const sensitivity = 830; // raised to hold low top speed after friction drop (matches engine.ts)
+  const sensitivity = 830 * speedMul; // raised to hold low top speed after friction drop (matches engine.ts)
   const friction = 0.92; // less glide than 0.985 so bots stop snappier (no ice skating)
   const radius = 9; // match ball radius (engine.ts) so bots fit same corridors
 
