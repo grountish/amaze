@@ -20,7 +20,7 @@ export function updateGame(
 ): LocalGameState {
   if (state.status !== "playing") return state;
 
-  const sensitivity = 260 * sensitivityMul; // base accel; also caps top speed (~linear). Lower = calmer + longer matches.
+  const sensitivity = 160 * sensitivityMul; // base accel; also caps top speed (~linear). Lower = calmer + longer matches.
   const friction = 0.985;
 
   const velocity = {
