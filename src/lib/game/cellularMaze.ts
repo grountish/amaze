@@ -61,11 +61,11 @@ export function createCellGrid(): CellGrid {
   };
 }
 
-// Deterministically flag ~count interior wall cells as "armored". They look
-// like normal walls until shot, then turn red and become permanent. Seeded by
-// the maze seed + cell index (no Math.random) so every client agrees and the
+// Deterministically flag a fraction of interior wall cells as "armored". They
+// look like normal walls until shot, then turn red and become permanent. Seeded
+// by the maze seed + cell index (no Math.random) so every client agrees and the
 // set varies per maze. Must run AFTER initGridFromMaze (needs final walls).
-export function markArmoredWalls(grid: CellGrid, seed: number, count = 12): void {
+export function markArmoredWalls(grid: CellGrid, seed: number, fraction = 0.2): void {
   grid.armored.fill(0);
   const picks: { i: number; h: number }[] = [];
   for (let r = 1; r < GRID_ROWS - 1; r++) {
@@ -78,6 +78,7 @@ export function markArmoredWalls(grid: CellGrid, seed: number, count = 12): void
     }
   }
   picks.sort((a, b) => b.h - a.h);
+  const count = Math.round(picks.length * fraction); // ~1/5 of real interior walls
   for (let k = 0; k < Math.min(count, picks.length); k++) grid.armored[picks[k].i] = 1;
 }
 
