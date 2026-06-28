@@ -56,7 +56,7 @@ export type Theme = {
 // terrains are implemented (sand/water/forest) ship in v1. "Wastes" is the
 // classic look with no terrain — keeps some mazes plain.
 export const THEMES: Theme[] = [
-  { name: "Wastes", bg: "#06060f", wall: "#2e2e50", wallOpen: "#224488", wallClosed: "#882222", terrains: [] },
+  { name: "Tundra", bg: "#0a0f18", wall: "#3a4a66", wallOpen: "#4a7ab0", wallClosed: "#6a8aaa", terrains: [TERRAIN.WATER, TERRAIN.FOREST, TERRAIN.SAND] },
   { name: "Desert", bg: "#181206", wall: "#7a5a2e", wallOpen: "#b07a3a", wallClosed: "#8a3b1e", terrains: [TERRAIN.SAND, TERRAIN.SAND, TERRAIN.SAND, TERRAIN.WATER] },
   { name: "Swamp",  bg: "#0a140e", wall: "#2e4a36", wallOpen: "#3a6a4a", wallClosed: "#5a6a22", terrains: [TERRAIN.WATER, TERRAIN.WATER, TERRAIN.FOREST] },
   { name: "Forest", bg: "#08130a", wall: "#2c4a2c", wallOpen: "#3f7a3f", wallClosed: "#6a5a22", terrains: [TERRAIN.FOREST, TERRAIN.FOREST, TERRAIN.WATER] },
@@ -109,14 +109,14 @@ export function paintTerrain(grid: CellGrid, seed: number, theme: Theme, maze: M
     return h / 4294967296;
   };
 
-  const BLOBS = 9;
+  const BLOBS = 14;
   const blobs: { c: number; r: number; rad: number; t: number }[] = [];
   for (let k = 0; k < BLOBS; k++) {
     const t = theme.terrains[Math.floor(rnd() * theme.terrains.length)];
     blobs.push({
       c: 2 + Math.floor(rnd() * (GRID_COLS - 4)),
       r: 2 + Math.floor(rnd() * (GRID_ROWS - 4)),
-      rad: 3 + rnd() * 5,
+      rad: 4 + rnd() * 6,
       t,
     });
   }
