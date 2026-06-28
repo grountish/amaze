@@ -8,7 +8,6 @@
           "$playerId": {
             ".write": "auth != null && (auth.uid === $playerId || $playerId.beginsWith('bot_'))",
             "hp": {
-              "comment": "Any racer can damage any other (shooting) — hp is writable by all authed users.",
               ".write": "auth != null"
             }
           }
