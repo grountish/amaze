@@ -103,7 +103,8 @@
   let bombCount = BOMB_START; // mines in inventory; drop with D, refill via purple nutrient
   let rafts = 1; // water-crossing charges; +RAFT_START from a cyan nutrient
   let onWater = false; // tracks water-cell entry transitions (drown / consume a raft)
-  let theme: Theme = pickTheme(1); // per-maze biome theme (palette + terrains); set per seed in onMount/applyMaze
+  let currentLap = 0; // shared room lap counter; drives which theme each maze uses
+  let theme: Theme = pickTheme(0); // per-maze biome theme; rotates by lap in onMount/applyMaze
   let boostLabel = ''; // speed-boost text, shown in the DOM stats panel (not over the maze)
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
@@ -297,7 +298,7 @@
     const mctx = mazeLayer.getContext('2d');
     if (!mctx) return;
 
-    const pal = theme ?? pickTheme(currentSeed);
+    const pal = theme ?? pickTheme(currentLap);
     mctx.fillStyle = pal.bg;
     mctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
@@ -1044,7 +1045,7 @@
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     markArmoredWalls(cellGrid, seed); // deterministic per-maze armored set
-    theme = pickTheme(seed); // per-maze biome palette + terrains
+    theme = pickTheme(currentLap); // theme rotates per lap; terrain layout per seed
     paintTerrain(cellGrid, seed, theme, activeMaze);
     cellGrid.pheromone.fill(0);
     cellGrid.evolved.fill(0);
@@ -1093,7 +1094,7 @@
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
     markArmoredWalls(cellGrid, currentSeed); // deterministic per-maze armored set
-    theme = pickTheme(currentSeed); // per-maze biome palette + terrains
+    theme = pickTheme(currentLap); // theme rotates per lap; terrain layout per seed
     paintTerrain(cellGrid, currentSeed, theme, activeMaze);
 
     // Aim defaults toward the hole (snapped to cardinal) until the player moves.
@@ -1164,8 +1165,20 @@
       subscribeToRoom(roomId, (r) => {
         if (!r) return;
         allZombies = !!r.rage; // zombify-trap rage flag (cleared on morph)
+        currentLap = r.lap ?? 0; // drives theme rotation; set before applyMaze
         const seed = seedFromMazeId(r.mazeId);
-        if (seed !== currentSeed) applyMaze(seed);
+        if (seed !== currentSeed) {
+          applyMaze(seed); // picks theme from currentLap + repaints
+        } else {
+          // lap & mazeId can land in separate RTDB events — if lap moved without
+          // a seed change (theme would otherwise lag a morph), re-theme in place.
+          const t = pickTheme(currentLap);
+          if (t !== theme && cellGrid) {
+            theme = t;
+            paintTerrain(cellGrid, currentSeed, theme, activeMaze);
+            mazeLayerDirty = true;
+          }
+        }
       }),
 
       subscribeToShortcut(roomId, (s) => { shortcutState = s; }),

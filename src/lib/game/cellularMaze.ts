@@ -62,10 +62,12 @@ export const THEMES: Theme[] = [
   { name: "Forest", bg: "#08130a", wall: "#2c4a2c", wallOpen: "#3f7a3f", wallClosed: "#6a5a22", terrains: [TERRAIN.FOREST, TERRAIN.FOREST, TERRAIN.WATER] },
 ];
 
-export function pickTheme(seed: number): Theme {
-  let h = (seed * 2654435761) >>> 0;
-  h = (h ^ (h >>> 15)) >>> 0;
-  return THEMES[h % THEMES.length];
+// Theme rotates by lap so every maze morph is a visibly different biome (no
+// hash collisions keeping the same theme two laps running). Shared lap counter
+// ⇒ all clients agree. Terrain layout still varies per seed (see paintTerrain).
+export function pickTheme(lap: number): Theme {
+  const i = ((lap % THEMES.length) + THEMES.length) % THEMES.length;
+  return THEMES[i];
 }
 
 export type NutrientData = {
