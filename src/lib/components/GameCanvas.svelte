@@ -97,6 +97,7 @@
   let lastBuildAt = 0;
   let lastBombAt = 0;
   let bombCount = BOMB_START; // mines in inventory; drop with D, refill via purple nutrient
+  let boostLabel = ''; // speed-boost text, shown in the DOM stats panel (not over the maze)
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
   let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
@@ -588,29 +589,19 @@
     // Back to screen space for the HUD / overlays (no camera transform).
     ctx.setTransform(1, 0, 0, 1, 0, 0);
 
-    // HUD — bottom bar
+    // Stats (bombs, speed boost) render as DOM outside the maze — see template.
+    // Here we only refresh the boost label, deduped so it doesn't churn Svelte
+    // reactivity every frame (changes ~1×/s as the countdown ticks).
     if (gameState) {
-      // Speed boost indicator
       const now_hud = Date.now();
       const activeBoosts = speedBoosts.filter((b) => b.expires > now_hud);
+      let newBoost = '';
       if (activeBoosts.length > 0) {
         const remaining = Math.max(0, Math.ceil((activeBoosts[0].expires - now_hud) / 1000));
         const factor = activeBoosts.reduce((f, b) => f * b.factor, 1.0);
-        ctx.save();
-        ctx.fillStyle = '#ffd700';
-        ctx.font = 'bold 15px monospace';
-        ctx.fillText(`⚡ ×${factor.toFixed(1)} ${remaining}s`, CANVAS_WIDTH - 140, CANVAS_HEIGHT - 30);
-        ctx.restore();
+        newBoost = `⚡ ×${factor.toFixed(1)} ${remaining}s`;
       }
-
-      // Bomb inventory
-      if (inputSource !== 'bot') {
-        ctx.save();
-        ctx.fillStyle = bombCount > 0 ? '#c46bff' : '#665';
-        ctx.font = 'bold 15px monospace';
-        ctx.fillText(`💣 ${bombCount}`, 16, CANVAS_HEIGHT - 30);
-        ctx.restore();
-      }
+      if (newBoost !== boostLabel) boostLabel = newBoost;
     }
 
     // Death flash overlay
@@ -1382,11 +1373,10 @@
 {/if}
 
 {#if inputSource !== 'bot'}
-  <button
-    class="bomb-btn"
-    on:pointerdown|preventDefault={dropBomb}
-    aria-label="Drop bomb"
-  >💣{bombCount}</button>
+  <div class="stats-panel">
+    <div class="stat"><span class="stat-ico">💣</span><span class="stat-val">{bombCount}</span></div>
+    {#if boostLabel}<div class="stat boost">{boostLabel}</div>{/if}
+  </div>
   <button
     class="build-btn"
     on:pointerdown|preventDefault={build}
@@ -1478,25 +1468,32 @@
     background: rgba(60, 140, 220, 0.95);
   }
 
-  .bomb-btn {
+  /* Stats live in the black margin below the maze, never over it. */
+  .stats-panel {
     position: fixed;
-    right: 12.25rem;
+    left: 1.25rem;
     bottom: 1.5rem;
-    width: 78px;
-    height: 78px;
-    border-radius: 50%;
-    border: 2px solid #c46bff;
-    background: rgba(110, 40, 160, 0.85);
-    color: #fff;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-family: monospace;
+    z-index: 40;
+    pointer-events: none;
+  }
+  .stat {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: rgba(20, 20, 40, 0.82);
+    border: 1px solid #3a3a6a;
+    border-radius: 8px;
+    padding: 0.3rem 0.6rem;
     font-weight: 800;
     font-size: 1rem;
-    letter-spacing: 0.02em;
-    touch-action: none;
-    user-select: none;
-    z-index: 40;
+    color: #c46bff;
+    width: fit-content;
   }
-
-  .bomb-btn:active {
-    background: rgba(150, 70, 210, 0.95);
-  }
+  .stat-ico { font-size: 1.1rem; }
+  .stat-val { font-variant-numeric: tabular-nums; }
+  .stat.boost { color: #ffd700; font-size: 0.9rem; }
 </style>
