@@ -298,7 +298,15 @@ export async function advanceMaze(roomId: string): Promise<void> {
     set(ref(db(), `${base}/mazeId`), String(nextSeed(seed))),
     set(ref(db(), `${base}/lap`), increment(1)),
     set(ref(db(), `${base}/mazeGrid`), null), // drop evolved deltas; fresh maze
+    set(ref(db(), `${base}/rage`), false), // fresh maze clears any zombie rage
   ]);
+}
+
+// Zombify-trap rage flag: when a human crosses one, every bot turns zombie
+// until the maze morphs. Leaf write (not a room-node update) so it never aborts
+// sibling trap/score transactions — same reason advanceMaze writes leaves.
+export async function setRage(roomId: string, on: boolean): Promise<void> {
+  await set(ref(db(), `rooms/${roomId}/rage`), on);
 }
 
 // Flip to playing AND stamp startedAt so the in-game timer actually starts.
@@ -420,12 +428,20 @@ export function subscribeToNutrients(
 
 import type { TrapData } from './types';
 
-export async function addTrap(roomId: string, col: number, row: number, armAt: number): Promise<void> {
+export async function addTrap(
+  roomId: string,
+  col: number,
+  row: number,
+  armAt: number,
+  kind?: "zombify",
+): Promise<void> {
   const trapsRef = ref(db(), `rooms/${roomId}/traps`);
   const snap = await get(trapsRef);
   const existing: Record<string, TrapData> = snap.val() ?? {};
   if (Object.keys(existing).length >= 8) return; // cap at 8
-  await update(trapsRef, { [`t_${Date.now()}`]: { col, row, armAt } });
+  const data: TrapData = { col, row, armAt };
+  if (kind) data.kind = kind; // omit when undefined — RTDB rejects undefined
+  await update(trapsRef, { [`t_${Date.now()}`]: data });
 }
 
 export async function triggerTrap(roomId: string, trapId: string): Promise<boolean> {

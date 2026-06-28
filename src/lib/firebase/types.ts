@@ -11,6 +11,7 @@ export type TrapData = {
   col: number;
   row: number;
   armAt?: number; // epoch ms when it becomes lethal; before that it only warns
+  kind?: "zombify"; // default (undefined) = lethal; "zombify" enrages all bots
 };
 
 // A projectile. Immutable + time-derived: position = origin + dir·speed·age, so
@@ -38,6 +39,7 @@ export type Room = {
   lapAt?: number; // when the current lap's maze was generated
   shortcut?: ShortcutState;
   mazeGrid?: string; // base64-encoded wall bitmap
+  rage?: boolean; // true → all bots are zombies (set by zombify trap, cleared on morph)
 };
 
 export type Player = {

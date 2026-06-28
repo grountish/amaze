@@ -34,6 +34,7 @@ export type CellGrid = {
   pheromone: Float32Array; // 0-1, local only
   hardness: Uint8Array;    // ticks needed to erode (255=indestructible)
   evolved: Int8Array;      // +1=just opened, -1=just closed, 0=stable
+  armored: Uint8Array;     // 1=armored wall: shot→permanent red, immune to evolution
   u: Float32Array;         // Gray-Scott substrate (0-1, local only)
   v: Float32Array;         // Gray-Scott activator — high V = Turing ridge
 };
@@ -54,9 +55,30 @@ export function createCellGrid(): CellGrid {
     pheromone: new Float32Array(n),
     hardness: new Uint8Array(n),
     evolved: new Int8Array(n),
+    armored: new Uint8Array(n),
     u,
     v: new Float32Array(n),
   };
+}
+
+// Deterministically flag ~count interior wall cells as "armored". They look
+// like normal walls until shot, then turn red and become permanent. Seeded by
+// the maze seed + cell index (no Math.random) so every client agrees and the
+// set varies per maze. Must run AFTER initGridFromMaze (needs final walls).
+export function markArmoredWalls(grid: CellGrid, seed: number, count = 12): void {
+  grid.armored.fill(0);
+  const picks: { i: number; h: number }[] = [];
+  for (let r = 1; r < GRID_ROWS - 1; r++) {
+    for (let c = 1; c < GRID_COLS - 1; c++) {
+      const i = cellIdx(c, r);
+      if (!grid.walls[i] || grid.hardness[i] === 255) continue; // real interior walls only
+      let h = (seed ^ (i * 2654435761)) >>> 0; // hash → deterministic scatter
+      h = (h ^ (h >>> 15)) >>> 0;
+      picks.push({ i, h });
+    }
+  }
+  picks.sort((a, b) => b.h - a.h);
+  for (let k = 0; k < Math.min(count, picks.length); k++) grid.armored[picks[k].i] = 1;
 }
 
 export function cellIdx(col: number, row: number): number {
@@ -302,6 +324,7 @@ export function evolveGrid(grid: CellGrid, maze: Maze): void {
 
       // Indestructible cells never change
       if (hard === 255) continue;
+      if (grid.armored[i]) continue; // armored walls are immune to evolution
       if (isProtected(c, r, maze)) { newWalls[i] = 0; grid.hardness[i] = 0; continue; }
 
       const ph = grid.pheromone[i];

@@ -10,11 +10,11 @@
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps, fireShot, subscribeToShots, pruneShots, damagePlayer, setPlayerHp } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps, fireShot, subscribeToShots, pruneShots, damagePlayer, setPlayerHp, setRage } from '$lib/firebase/rooms';
   import { setupPresence } from '$lib/firebase/presence';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState, TrapData, ShotData } from '$lib/firebase/types';
-  import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
+  import { createCellGrid, initGridFromMaze, markArmoredWalls, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
   import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
   import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround, hasLineOfSight } from '$lib/game/botAI';
   import type { BotGenome, BotPhysicsState, GridPath } from '$lib/game/botAI';
@@ -94,6 +94,8 @@
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
   let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
+  let armoredHit = new Set<number>(); // armored cells I've shot (local, turn red)
+  let allZombies = false; // zombify-trap rage: every bot is a zombie (room-driven)
 
   // Player death / respawn
   let deathFlashUntil = 0;
@@ -136,9 +138,18 @@
   // racing. Derived purely from the bot id (hash parity) so the host AI and
   // every client agree with zero extra network — no stored role field.
   function isZombie(id: string): boolean {
+    if (allZombies) return true; // zombify-trap rage: everyone hunts
     let hash = 0;
     for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) & 0xffffffff;
     return (Math.abs(hash) & 1) === 0;
+  }
+
+  // Snap an input vector to a single cardinal axis (no diagonals): keep the
+  // dominant axis (preserving its analog magnitude), zero the other; tie → x.
+  function snapCardinal(v: { x: number; y: number }): { x: number; y: number } {
+    const ax = Math.abs(v.x), ay = Math.abs(v.y);
+    if (ax === 0 && ay === 0) return { x: 0, y: 0 };
+    return ax >= ay ? { x: v.x, y: 0 } : { x: 0, y: v.y };
   }
 
   // A little battlemented keep, drawn in world space at (cx,cy). Used to mark
@@ -198,10 +209,9 @@
     const nowMs = Date.now();
     if (nowMs - lastShotAt < FIRE_COOLDOWN) return;
     lastShotAt = nowMs;
-    let dx = gameState.ball.velocity.x, dy = gameState.ball.velocity.y;
-    const mag = Math.hypot(dx, dy);
-    if (mag < 1) { dx = lastHeading.x; dy = lastHeading.y; }
-    else { dx /= mag; dy /= mag; lastHeading = { x: dx, y: dy }; }
+    // lastHeading is maintained per-frame as a unit cardinal vector, so just aim
+    // along it — the on-screen aim line and the shot always agree.
+    const dx = lastHeading.x, dy = lastHeading.y;
     fireShot(roomId, {
       owner: playerId,
       // Spawn just ahead of the ball so it doesn't clip our own cell.
@@ -237,7 +247,9 @@
           const i = r * GRID_COLS + c;
           if (!cellGrid.walls[i]) continue;
           const ev = cellGrid.evolved[i];
-          mctx.fillStyle = ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
+          mctx.fillStyle = armoredHit.has(i)
+            ? '#ff2a2a' // revealed armored wall: permanent red
+            : ev === -1 ? '#882222' : ev === 1 ? '#224488' : '#2e2e50';
           mctx.fillRect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE);
         }
       }
@@ -316,24 +328,42 @@
       for (const [, trap] of Object.entries(traps)) {
         const tx = trap.col * CELL_SIZE + CELL_SIZE / 2;
         const ty = trap.row * CELL_SIZE + CELL_SIZE / 2;
+        // Zombify traps read green (not a killer — they enrage the bots instead).
+        const zomb = trap.kind === 'zombify';
         const arming = trap.armAt != null && drawNow < trap.armAt;
         if (arming) {
-          // Telegraph: an amber ring closes in as the trap arms, so the danger
-          // is visible from a distance well before it can kill you.
+          // Telegraph: a ring closes in as the trap arms, so the danger is
+          // visible from a distance well before it triggers.
           const progress = Math.max(0, Math.min(1, 1 - (trap.armAt! - drawNow) / TRAP_ARM_MS));
           const ringR = 26 - 14 * progress; // shrinks toward the cell
           const blink = 0.5 + 0.5 * Math.sin(drawNow / 90);
           ctx.save();
-          ctx.strokeStyle = `rgba(255,190,40,${0.45 + 0.45 * blink})`;
+          ctx.strokeStyle = zomb
+            ? `rgba(70,220,90,${0.45 + 0.45 * blink})`
+            : `rgba(255,190,40,${0.45 + 0.45 * blink})`;
           ctx.lineWidth = 2;
           ctx.beginPath();
           ctx.arc(tx, ty, ringR, 0, Math.PI * 2);
           ctx.stroke();
           // Center dot growing toward "live"
-          ctx.fillStyle = `rgba(255,120,30,${0.3 + 0.5 * progress})`;
+          ctx.fillStyle = zomb
+            ? `rgba(40,200,60,${0.3 + 0.5 * progress})`
+            : `rgba(255,120,30,${0.3 + 0.5 * progress})`;
           ctx.beginPath();
           ctx.arc(tx, ty, 2 + 3 * progress, 0, Math.PI * 2);
           ctx.fill();
+          ctx.restore();
+        } else if (zomb) {
+          // Live zombify trap: pulsing green biohazard-ish double ring.
+          const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
+          ctx.save();
+          ctx.strokeStyle = `rgba(60,220,80,${0.8 + 0.2 * pulse})`;
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(tx, ty, 7 * pulse, 0, Math.PI * 2);
+          ctx.moveTo(tx + 3, ty);
+          ctx.arc(tx, ty, 3, 0, Math.PI * 2);
+          ctx.stroke();
           ctx.restore();
         } else {
           const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
@@ -452,6 +482,29 @@
       ctx.restore();
     }
 
+    // ── Aim line: shows where the gun points (the firing heading) ──
+    if (gameState && gameState.status === 'playing' && inputSource !== 'bot') {
+      const { position, radius } = gameState.ball;
+      const len = 30;
+      const sx = position.x + lastHeading.x * (radius + 3);
+      const sy = position.y + lastHeading.y * (radius + 3);
+      const ex = position.x + lastHeading.x * (radius + len);
+      const ey = position.y + lastHeading.y * (radius + len);
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.strokeStyle = '#ffe066';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(ex, ey, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffe066';
+      ctx.fill();
+      ctx.restore();
+    }
+
     // ── Shots (time-derived positions) ─────────────────────────
     for (const [, s] of Object.entries(shots)) {
       const p = shotXY(s, drawNow);
@@ -544,7 +597,7 @@
 
     // A local bot drives its own input loop (set up in onMount); skip human physics.
     if (inputSource !== 'bot') {
-      const currentInput = get(input);
+      const currentInput = snapCardinal(get(input)); // 4-dir only, no diagonals
       const nowMs = Date.now();
 
       // Speed boost from nutrients
@@ -596,7 +649,9 @@
                   .map((p) => ({ col: Math.floor(p.x! / CELL_SIZE), row: Math.floor(p.y! / CELL_SIZE) })),
               ];
               const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells, playerCells);
-              if (trapCell) addTrap(roomId, trapCell.col, trapCell.row, nowMs + TRAP_ARM_MS).catch(console.error);
+              // ~1 in 5 is a zombify trap (enrages all bots) instead of a killer.
+              const kind: 'zombify' | undefined = Math.random() < 0.2 ? 'zombify' : undefined;
+              if (trapCell) addTrap(roomId, trapCell.col, trapCell.row, nowMs + TRAP_ARM_MS, kind).catch(console.error);
             }
 
             // Prune expired shots so the shots node can't accumulate.
@@ -638,15 +693,23 @@
           if (ddx * ddx + ddy * ddy < 400) {
             triggeredTraps.add(id);
             triggerTrap(roomId, id).catch(console.error);
-            deathFlashUntil = nowMs + 800;
-            gameState = {
-              ...gameState,
-              ball: {
-                ...gameState.ball,
-                position: { ...activeMaze.startPosition },
-                velocity: { x: 0, y: 0 },
-              },
-            };
+            if (trap.kind === 'zombify') {
+              // Not lethal — enrages every bot until the maze morphs.
+              setRage(roomId, true).catch(console.error);
+              lapFlash = 'ZOMBIES ENRAGED!';
+              if (lapFlashTimer) clearTimeout(lapFlashTimer);
+              lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
+            } else {
+              deathFlashUntil = nowMs + 800;
+              gameState = {
+                ...gameState,
+                ball: {
+                  ...gameState.ball,
+                  position: { ...activeMaze.startPosition },
+                  velocity: { x: 0, y: 0 },
+                },
+              };
+            }
           }
         }
       }
@@ -668,6 +731,14 @@
             const cc = Math.floor(p.x / CELL_SIZE), cr = Math.floor(p.y / CELL_SIZE);
             const ci = cr * GRID_COLS + cc;
             if (cellGrid.walls[ci] && cellGrid.hardness[ci] !== 255) {
+              // Armored wall: shot reveals it as permanent red, never removed.
+              // (Don't touch hardness — the !==255 guard above must stay true so
+              // later shots still register and don't tunnel through.)
+              if (cellGrid.armored[ci]) {
+                if (!armoredHit.has(ci)) { armoredHit.add(ci); mazeLayerDirty = true; }
+                consumedShots.add(id); toPrune.push(id);
+                continue;
+              }
               const hits = (wallHits.get(ci) ?? 0) + 1;
               if (hits >= WALL_HP) {
                 wallHits.delete(ci);
@@ -757,6 +828,17 @@
         }
       }
 
+      // Track aim as a unit cardinal heading from actual motion. Only update
+      // when moving with intent (threshold skips jitter); hold it when ~still,
+      // so the aim line + shots keep pointing where you last went.
+      {
+        const vx = gameState.ball.velocity.x, vy = gameState.ball.velocity.y;
+        if (vx * vx + vy * vy > 18 * 18) {
+          const s = snapCardinal({ x: vx, y: vy });
+          lastHeading = { x: Math.sign(s.x), y: Math.sign(s.y) };
+        }
+      }
+
       // Shortcut zone entry/exit detection
       if (activeMaze.shortcut) {
         const { x, y } = gameState.ball.position;
@@ -821,9 +903,12 @@
     if (!cellGrid) cellGrid = createCellGrid();
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
+    markArmoredWalls(cellGrid, seed); // deterministic per-maze armored set
     cellGrid.pheromone.fill(0);
     cellGrid.evolved.fill(0);
     wallHits.clear(); // wall damage doesn't carry to a fresh maze
+    armoredHit.clear(); // armored reveals reset on a fresh maze
+    allZombies = false; // fresh maze clears rage locally (authoritative reset in advanceMaze)
     mazeLayerDirty = true; // brand-new maze ⇒ re-rasterise
     // Reset local ball to start
     if (gameState) {
@@ -864,13 +949,14 @@
     cellGrid = createCellGrid();
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
+    markArmoredWalls(cellGrid, currentSeed); // deterministic per-maze armored set
 
-    // Aim defaults toward the hole until the player starts moving.
+    // Aim defaults toward the hole (snapped to cardinal) until the player moves.
     {
       const ahx = activeMaze.hole.x - activeMaze.startPosition.x;
       const ahy = activeMaze.hole.y - activeMaze.startPosition.y;
-      const am = Math.hypot(ahx, ahy) || 1;
-      lastHeading = { x: ahx / am, y: ahy / am };
+      const s = snapCardinal({ x: ahx, y: ahy });
+      lastHeading = { x: Math.sign(s.x), y: Math.sign(s.y) };
     }
 
     // Fire with Space (any human). preventDefault stops the page scrolling.
@@ -916,7 +1002,7 @@
           localBotGenome, localBotPath, localBotWpIdx, x, y, cellGrid,
         );
         localBotWpIdx = nextWaypointIdx;
-        input.set(botInput);
+        input.set(snapCardinal(botInput)); // 4-dir only
       }, 100);
       cleanupFns.push(() => clearInterval(localBotId));
     }
@@ -928,6 +1014,7 @@
       // morph the maze, so normal play keeps the same (evolving) maze.
       subscribeToRoom(roomId, (r) => {
         if (!r) return;
+        allZombies = !!r.rage; // zombify-trap rage flag (cleared on morph)
         const seed = seedFromMazeId(r.mazeId);
         if (seed !== currentSeed) applyMaze(seed);
       }),
@@ -1079,6 +1166,7 @@
         // Trap check
         let hitTrap = false;
         for (const [trapId, trap] of Object.entries(traps)) {
+          if (trap.kind === 'zombify') continue; // bots ignore zombify traps (human-only)
           const tx = (trap.col + 0.5) * CELL_SIZE, ty = (trap.row + 0.5) * CELL_SIZE;
           const ddx = state.physics.x - tx, ddy = state.physics.y - ty;
           if (ddx * ddx + ddy * ddy < 400) {
@@ -1161,8 +1249,11 @@
           state.waypointIdx = r.nextWaypointIdx;
         }
 
-        // Step physics, then reveal the cells we moved into
-        state.physics = stepBotPhysics(state.physics, botInput.x, botInput.y, cellGrid, botDt);
+        // Step physics, then reveal the cells we moved into. Snap to a single
+        // cardinal axis (4-dir) and sign-normalize to unit so the bot keeps full
+        // speed instead of crawling on a ~0.7 diagonal component.
+        const bs = snapCardinal(botInput);
+        state.physics = stepBotPhysics(state.physics, Math.sign(bs.x), Math.sign(bs.y), cellGrid, botDt);
         revealAround(state.known, state.physics.x, state.physics.y);
 
         // Bot deposits pheromone
