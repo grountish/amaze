@@ -775,14 +775,16 @@
               continue;
             }
           }
-          // Racer hit → damage whoever it lands on (not the shooter).
+          // Racer hit → bots die in one shot (hp→0 triggers their respawn);
+          // human players still take MAX_HP hits (decrement).
           let hit = false;
           for (const pl of get(players)) {
             if (pl.id === playerId || pl.x == null || pl.y == null) continue;
             const ddx = pl.x - p.x, ddy = pl.y - p.y;
             const rr = 9 + SHOT_RADIUS;
             if (ddx * ddx + ddy * ddy < rr * rr) {
-              damagePlayer(roomId, pl.id).catch(console.error);
+              if (pl.inputSource === 'bot') setPlayerHp(roomId, pl.id, 0).catch(console.error);
+              else damagePlayer(roomId, pl.id).catch(console.error);
               consumedShots.add(id); toPrune.push(id);
               hit = true;
               break;
