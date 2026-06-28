@@ -482,26 +482,22 @@
       ctx.restore();
     }
 
-    // ── Aim line: shows where the gun points (the firing heading) ──
+    // ── Aim marker: small nub on the ball edge showing the firing heading ──
     if (gameState && gameState.status === 'playing' && inputSource !== 'bot') {
       const { position, radius } = gameState.ball;
-      const len = 30;
-      const sx = position.x + lastHeading.x * (radius + 3);
-      const sy = position.y + lastHeading.y * (radius + 3);
-      const ex = position.x + lastHeading.x * (radius + len);
-      const ey = position.y + lastHeading.y * (radius + len);
+      const sx = position.x + lastHeading.x * (radius - 2);
+      const sy = position.y + lastHeading.y * (radius - 2);
+      const ex = position.x + lastHeading.x * (radius + 5);
+      const ey = position.y + lastHeading.y * (radius + 5);
       ctx.save();
-      ctx.globalAlpha = 0.55;
+      ctx.globalAlpha = 0.85;
       ctx.strokeStyle = '#ffe066';
       ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
       ctx.beginPath();
       ctx.moveTo(sx, sy);
       ctx.lineTo(ex, ey);
       ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(ex, ey, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = '#ffe066';
-      ctx.fill();
       ctx.restore();
     }
 
