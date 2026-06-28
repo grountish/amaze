@@ -1161,18 +1161,10 @@
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
         const dGx = state.physics.x - sx, dGy = state.physics.y - sy;
 
-        // Reached the human's start? → score this bot and reset only it. The
-        // first finisher of the round also advances the maze for everyone (gated).
-        // Zombies never "win" the race — they only hunt, so they skip this.
+        // Reached the human's start? Bots never win or advance the maze in
+        // battle mode — only the human does. A racer that arrives just resets
+        // back to its lair and runs again. (Zombies skip this; they hunt.)
         if (!zombie && Math.sqrt(dGx * dGx + dGy * dGy) < 16) {
-          scoreLap(roomId, bot.id).catch(console.error);
-          if (!lapWinSent) {
-            lapWinSent = true;
-            advanceMaze(roomId).catch(console.error);
-            lapFlash = 'New maze!';
-            if (lapFlashTimer) clearTimeout(lapFlashTimer);
-            lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
-          }
           state = {
             ...state,
             physics: { x: hx, y: hy, vx: 0, vy: 0 },
