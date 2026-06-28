@@ -10,7 +10,7 @@
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps, fireShot, subscribeToShots, pruneShots, damagePlayer, setPlayerHp, setRage } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps, pruneTraps, fireShot, subscribeToShots, pruneShots, damagePlayer, setPlayerHp, setRage } from '$lib/firebase/rooms';
   import { setupPresence } from '$lib/firebase/presence';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
   import type { InputSource, ShortcutState, TrapData, ShotData } from '$lib/firebase/types';
@@ -39,6 +39,8 @@
   const ZOOM = Math.min(CANVAS_WIDTH / WORLD_WIDTH, CANVAS_HEIGHT / WORLD_HEIGHT);
   // How long a trap telegraphs (warning ring) before it becomes lethal.
   const TRAP_ARM_MS = 1500;
+  // Un-triggered traps/bombs are pruned after this so the node can't fill up.
+  const TRAP_TTL = 25000;
   // Shooting. Projectiles are time-derived (pos = origin + dir·speed·age), so
   // they cost zero per-frame network. Each shot is processed by its owner only.
   const SHOT_SPEED = 520; // px/s
@@ -258,7 +260,7 @@
   function dropBomb() {
     if (inputSource === 'bot' || !gameState || gameState.status !== 'playing' || !cellGrid) return;
     if (bombCount <= 0) return;
-    if (Object.keys(traps).length >= 14) return; // trap node full — don't waste a bomb
+    if (Object.keys(traps).length >= 20) return; // whole trap node full — don't waste a bomb
     const nowMs = Date.now();
     if (nowMs - lastBombAt < BOMB_COOLDOWN) return;
     const pcc = Math.floor(gameState.ball.position.x / CELL_SIZE);
@@ -730,6 +732,13 @@
               .filter(([, s]) => nowMs - s.firedAt > SHOT_TTL)
               .map(([id]) => id);
             if (staleShots.length) pruneShots(roomId, staleShots).catch(console.error);
+
+            // Prune un-triggered traps/bombs past their lifetime — otherwise the
+            // node fills and new bomb drops get silently rejected. The key is
+            // `t_<ms>`, so age = now - that timestamp.
+            const staleTraps = Object.keys(traps)
+              .filter((id) => nowMs - (parseInt(id.slice(2), 10) || 0) > TRAP_TTL);
+            if (staleTraps.length) pruneTraps(roomId, staleTraps).catch(console.error);
           }
         }
 

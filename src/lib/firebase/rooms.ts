@@ -439,7 +439,13 @@ export async function addTrap(
   const trapsRef = ref(db(), `rooms/${roomId}/traps`);
   const snap = await get(trapsRef);
   const existing: Record<string, TrapData> = snap.val() ?? {};
-  if (Object.keys(existing).length >= 14) return; // cap (AI traps + player bombs)
+  // Separate caps so AI traps can't starve player bombs (they share the node).
+  const all = Object.values(existing);
+  if (kind === "bomb") {
+    if (all.length >= 20) return; // hard ceiling on the whole node
+  } else if (all.filter((t) => t.kind !== "bomb").length >= 8) {
+    return; // AI traps (killer + zombify) capped on their own
+  }
   const data: TrapData = { col, row, armAt };
   if (kind) data.kind = kind; // omit when undefined — RTDB rejects undefined
   await update(trapsRef, { [`t_${Date.now()}`]: data });
@@ -460,6 +466,15 @@ export function subscribeToTraps(
   callback: (traps: Record<string, TrapData>) => void,
 ): () => void {
   return onValue(ref(db(), `rooms/${roomId}/traps`), (snap) => callback(snap.val() ?? {}));
+}
+
+// Remove traps by id (host prunes ones that have outlived TRAP_TTL so the node
+// can't fill up with un-triggered traps/bombs and block new drops).
+export async function pruneTraps(roomId: string, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const payload: Record<string, null> = {};
+  for (const id of ids) payload[id] = null;
+  await update(ref(db(), `rooms/${roomId}/traps`), payload);
 }
 
 // ── Shots ──────────────────────────────────────────────────────
