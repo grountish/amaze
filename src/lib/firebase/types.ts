@@ -13,6 +13,18 @@ export type TrapData = {
   armAt?: number; // epoch ms when it becomes lethal; before that it only warns
 };
 
+// A projectile. Immutable + time-derived: position = origin + dir·speed·age, so
+// it's written ONCE and every client computes its path locally (no per-frame
+// network). Processed authoritatively by its owner.
+export type ShotData = {
+  owner: string;
+  x: number; // origin
+  y: number;
+  dx: number; // unit direction
+  dy: number;
+  firedAt: number; // epoch ms
+};
+
 export type Room = {
   id: string;
   status: RoomStatus;
@@ -40,6 +52,7 @@ export type Player = {
   finishedAt?: number;
   lastSeenAt?: number;
   score?: number; // laps won (endless morph)
+  hp?: number; // shots-to-die health; respawns at 0 (see MAX_HP)
 };
 
 export type GameEvent =

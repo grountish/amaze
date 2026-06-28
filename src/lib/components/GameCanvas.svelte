@@ -10,10 +10,10 @@
   import { startKeyboardInput } from '$lib/input/keyboardInput';
   import { startMotionInput } from '$lib/input/motionInput';
   import JoystickOverlay from '$lib/components/JoystickOverlay.svelte';
-  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps } from '$lib/firebase/rooms';
+  import { updatePlayerPosition, updateBotPositions, scoreLap, advanceMaze, subscribeToRoom, subscribeToPlayers, enterShortcut, exitShortcut, subscribeToShortcut, updateMazeGrid, subscribeToMazeGrid, syncNutrients, collectNutrient, subscribeToNutrients, addTrap, triggerTrap, subscribeToTraps, fireShot, subscribeToShots, pruneShots, damagePlayer, setPlayerHp } from '$lib/firebase/rooms';
   import { setupPresence } from '$lib/firebase/presence';
   import type { LocalGameState, GameInput, Maze } from '$lib/game/types';
-  import type { InputSource, ShortcutState, TrapData } from '$lib/firebase/types';
+  import type { InputSource, ShortcutState, TrapData, ShotData } from '$lib/firebase/types';
   import { createCellGrid, initGridFromMaze, protectZone, depositPheromone, decayPheromone, evolveGrid, serializeWalls, deserializeWalls, getLocalWalls, findNutrientPositions, pickTrapCell, GRID_COLS, GRID_ROWS, CELL_SIZE, EVOLUTION_INTERVAL } from '$lib/game/cellularMaze';
   import type { CellGrid, NutrientData } from '$lib/game/cellularMaze';
   import { defaultGenome, mutate, bfsPath, computeBotInput, stepBotPhysics, isStuck, createHazard, recordDeath, createKnown, revealAround } from '$lib/game/botAI';
@@ -39,6 +39,13 @@
   const ZOOM = Math.min(CANVAS_WIDTH / WORLD_WIDTH, CANVAS_HEIGHT / WORLD_HEIGHT);
   // How long a trap telegraphs (warning ring) before it becomes lethal.
   const TRAP_ARM_MS = 1500;
+  // Shooting. Projectiles are time-derived (pos = origin + dir·speed·age), so
+  // they cost zero per-frame network. Each shot is processed by its owner only.
+  const SHOT_SPEED = 520; // px/s
+  const SHOT_TTL = 1400; // ms before a shot expires
+  const SHOT_RADIUS = 4;
+  const FIRE_COOLDOWN = 380; // ms between shots
+  const MAX_HP = 3; // hits to die
   const POSITION_SYNC_THROTTLE = 50;
 
   const PLAYER_COLORS = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dda0dd'];
@@ -80,6 +87,12 @@
   let traps: Record<string, TrapData> = {};
   let triggeredTraps = new Set<string>();
 
+  // Shooting
+  let shots: Record<string, ShotData> = {};
+  let consumedShots = new Set<string>(); // ids we've already resolved locally
+  let lastShotAt = 0;
+  let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
+
   // Player death / respawn
   let deathFlashUntil = 0;
 
@@ -106,6 +119,31 @@
       hash = (hash * 31 + pid.charCodeAt(i)) & 0xffffffff;
     }
     return PLAYER_COLORS[Math.abs(hash) % PLAYER_COLORS.length];
+  }
+
+  // Current position of a shot, derived purely from how long it's been alive.
+  function shotXY(s: ShotData, nowMs: number): { x: number; y: number; age: number } {
+    const age = (nowMs - s.firedAt) / 1000;
+    return { x: s.x + s.dx * SHOT_SPEED * age, y: s.y + s.dy * SHOT_SPEED * age, age };
+  }
+
+  // Fire a shot in the ball's heading (last movement direction). Rate-limited.
+  function fire() {
+    if (inputSource === 'bot' || !gameState || gameState.status !== 'playing') return;
+    const nowMs = Date.now();
+    if (nowMs - lastShotAt < FIRE_COOLDOWN) return;
+    lastShotAt = nowMs;
+    let dx = gameState.ball.velocity.x, dy = gameState.ball.velocity.y;
+    const mag = Math.hypot(dx, dy);
+    if (mag < 1) { dx = lastHeading.x; dy = lastHeading.y; }
+    else { dx /= mag; dy /= mag; lastHeading = { x: dx, y: dy }; }
+    fireShot(roomId, {
+      owner: playerId,
+      // Spawn just ahead of the ball so it doesn't clip our own cell.
+      x: gameState.ball.position.x + dx * (gameState.ball.radius + SHOT_RADIUS + 1),
+      y: gameState.ball.position.y + dy * (gameState.ball.radius + SHOT_RADIUS + 1),
+      dx, dy, firedAt: nowMs,
+    }).catch(console.error);
   }
 
   // The maze walls + Turing tint only change on the 1.5s evolution tick, not
@@ -335,6 +373,34 @@
       ctx.restore();
     }
 
+    // ── Shots (time-derived positions) ─────────────────────────
+    for (const [, s] of Object.entries(shots)) {
+      const p = shotXY(s, drawNow);
+      if (p.age > SHOT_TTL / 1000) continue;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, SHOT_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle = s.owner === playerId ? '#ffe066' : '#ff8c42';
+      ctx.fill();
+    }
+
+    // ── Health pips above each racer with < full hp ────────────
+    for (const pl of allPlayers) {
+      const hp = pl.hp ?? MAX_HP;
+      if (hp >= MAX_HP || hp < 0) continue;
+      let px: number, py: number;
+      if (pl.id === playerId && gameState) {
+        px = gameState.ball.position.x; py = gameState.ball.position.y;
+      } else {
+        const dp = opponentDisplayPos.get(pl.id);
+        if (!dp) continue;
+        px = dp.x; py = dp.y;
+      }
+      for (let h = 0; h < MAX_HP; h++) {
+        ctx.fillStyle = h < hp ? '#44dd66' : '#552222';
+        ctx.fillRect(px - 9 + h * 7, py - 20, 5, 3);
+      }
+    }
+
     // Back to screen space for the HUD / overlays (no camera transform).
     ctx.setTransform(1, 0, 0, 1, 0, 0);
 
@@ -474,6 +540,12 @@
               const trapCell = pickTrapCell(cellGrid, activeMaze, existingTrapCells, playerCells);
               if (trapCell) addTrap(roomId, trapCell.col, trapCell.row, nowMs + TRAP_ARM_MS).catch(console.error);
             }
+
+            // Prune expired shots so the shots node can't accumulate.
+            const staleShots = Object.entries(shots)
+              .filter(([, s]) => nowMs - s.firedAt > SHOT_TTL)
+              .map(([id]) => id);
+            if (staleShots.length) pruneShots(roomId, staleShots).catch(console.error);
           }
         }
 
@@ -520,6 +592,62 @@
             };
           }
         }
+      }
+
+      // ── Shots: resolve only MY OWN shots (shooter-authoritative). Hit a wall
+      // → remove that cell + broadcast. Hit another racer (incl. bots) → -1 hp.
+      // Other clients just render; the victim/host handles death+respawn.
+      if (gameState.status === 'playing') {
+        const toPrune: string[] = [];
+        for (const [id, s] of Object.entries(shots)) {
+          if (s.owner !== playerId || consumedShots.has(id)) continue;
+          const p = shotXY(s, nowMs);
+          if (p.age > SHOT_TTL / 1000) { consumedShots.add(id); toPrune.push(id); continue; }
+          if (p.x < 0 || p.y < 0 || p.x > WORLD_WIDTH || p.y > WORLD_HEIGHT) {
+            consumedShots.add(id); toPrune.push(id); continue;
+          }
+          // Wall hit → carve the cell open.
+          if (cellGrid) {
+            const cc = Math.floor(p.x / CELL_SIZE), cr = Math.floor(p.y / CELL_SIZE);
+            const ci = cr * GRID_COLS + cc;
+            if (cellGrid.walls[ci] && cellGrid.hardness[ci] !== 255) {
+              cellGrid.walls[ci] = 0;
+              cellGrid.hardness[ci] = 0;
+              mazeLayerDirty = true;
+              updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
+              consumedShots.add(id); toPrune.push(id);
+              continue;
+            }
+          }
+          // Racer hit → damage whoever it lands on (not the shooter).
+          let hit = false;
+          for (const pl of get(players)) {
+            if (pl.id === playerId || pl.x == null || pl.y == null) continue;
+            const ddx = pl.x - p.x, ddy = pl.y - p.y;
+            const rr = 9 + SHOT_RADIUS;
+            if (ddx * ddx + ddy * ddy < rr * rr) {
+              damagePlayer(roomId, pl.id).catch(console.error);
+              consumedShots.add(id); toPrune.push(id);
+              hit = true;
+              break;
+            }
+          }
+          if (hit) continue;
+        }
+        if (toPrune.length) pruneShots(roomId, toPrune).catch(console.error);
+      }
+
+      // Took 3 hits (hp ran out) → respawn at start with fresh hp. Driven off the
+      // synced hp the shooters decremented, so it triggers no matter who shot me.
+      const myRec = get(players).find((p) => p.id === playerId);
+      if (gameState.status === 'playing' && myRec && myRec.hp != null && myRec.hp <= 0) {
+        deathFlashUntil = nowMs + 800;
+        gameState = {
+          ...gameState,
+          ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
+          progress: 0,
+        };
+        setPlayerHp(roomId, playerId, MAX_HP).catch(console.error);
       }
 
       // Build physics walls from grid + optional shortcut collapse
@@ -655,6 +783,23 @@
     initGridFromMaze(cellGrid, activeMaze);
     if (activeMaze.shortcut) protectZone(cellGrid, activeMaze.shortcut.zone);
 
+    // Aim defaults toward the hole until the player starts moving.
+    {
+      const ahx = activeMaze.hole.x - activeMaze.startPosition.x;
+      const ahy = activeMaze.hole.y - activeMaze.startPosition.y;
+      const am = Math.hypot(ahx, ahy) || 1;
+      lastHeading = { x: ahx / am, y: ahy / am };
+    }
+
+    // Fire with Space (any human). preventDefault stops the page scrolling.
+    if (inputSource !== 'bot') {
+      const onFireKey = (e: KeyboardEvent) => {
+        if (e.code === 'Space') { e.preventDefault(); fire(); }
+      };
+      window.addEventListener('keydown', onFireKey);
+      cleanupFns.push(() => window.removeEventListener('keydown', onFireKey));
+    }
+
     if (inputSource === 'keyboard') {
       cleanupFns.push(startKeyboardInput());
     } else if (inputSource === 'motion') {
@@ -721,6 +866,14 @@
 
       subscribeToTraps(roomId, (t) => { traps = t; }),
 
+      subscribeToShots(roomId, (s) => {
+        shots = s;
+        // Drop consumed-ids that no longer exist so the set can't grow forever.
+        if (consumedShots.size) {
+          for (const id of consumedShots) if (!(id in s)) consumedShots.delete(id);
+        }
+      }),
+
       subscribeToPlayers(roomId, (p) => {
         players.set(p);
         for (const pl of p) {
@@ -759,9 +912,19 @@
         let state = botAIStates.get(bot.id);
         if (!state) continue;
 
-        // Progress towards hole
         const hx = activeMaze.hole.x, hy = activeMaze.hole.y;
         const sx = activeMaze.startPosition.x, sy = activeMaze.startPosition.y;
+
+        // Shot down (hp ran out) → respawn at start with fresh hp.
+        if (bot.hp != null && bot.hp <= 0) {
+          state = { ...state, physics: { x: sx, y: sy, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
+          botAIStates.set(bot.id, state);
+          setPlayerHp(roomId, bot.id, MAX_HP).catch(console.error);
+          botWrites.push({ id: bot.id, x: sx, y: sy, progress: 0 });
+          continue;
+        }
+
+        // Progress towards hole
         const dpx = state.physics.x - sx, dpy = state.physics.y - sy;
         const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2) || 1; // avoid /0
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
@@ -904,6 +1067,14 @@
   <JoystickOverlay />
 {/if}
 
+{#if inputSource !== 'bot'}
+  <button
+    class="fire-btn"
+    on:pointerdown|preventDefault={fire}
+    aria-label="Shoot"
+  >FIRE</button>
+{/if}
+
 <style>
   .game-container {
     position: relative;
@@ -937,5 +1108,27 @@
     pointer-events: none;
     text-shadow: 0 0 12px rgba(255, 215, 0, 0.7);
     z-index: 30;
+  }
+
+  .fire-btn {
+    position: fixed;
+    right: 1.25rem;
+    bottom: 1.5rem;
+    width: 78px;
+    height: 78px;
+    border-radius: 50%;
+    border: 2px solid #ffae42;
+    background: rgba(200, 60, 20, 0.85);
+    color: #fff;
+    font-weight: 800;
+    font-size: 0.95rem;
+    letter-spacing: 0.04em;
+    touch-action: none;
+    user-select: none;
+    z-index: 40;
+  }
+
+  .fire-btn:active {
+    background: rgba(255, 120, 40, 0.95);
   }
 </style>

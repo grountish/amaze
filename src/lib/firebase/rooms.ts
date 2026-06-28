@@ -148,6 +148,7 @@ export async function joinRoom(roomId: string, playerName: string, inputSource: 
     inputSource,
     progress: 0,
     lastSeenAt: now,
+    hp: 3,
   };
 
   const playerRef = ref(db(), `rooms/${roomId}/players/${user.uid}`);
@@ -346,6 +347,7 @@ export async function addBotPlayer(roomId: string): Promise<string> {
     inputSource: "bot",
     progress: 0,
     lastSeenAt: now,
+    hp: 3,
   };
   await set(ref(db(), `rooms/${roomId}/players/${botId}`), botData);
   return botId;
@@ -466,4 +468,40 @@ export function subscribeToTraps(
   callback: (traps: Record<string, TrapData>) => void,
 ): () => void {
   return onValue(ref(db(), `rooms/${roomId}/traps`), (snap) => callback(snap.val() ?? {}));
+}
+
+// ── Shots ──────────────────────────────────────────────────────
+
+import type { ShotData } from './types';
+
+// One write per shot. Position is derived from firedAt on every client, so the
+// projectile never needs a position update — see ShotData.
+export async function fireShot(roomId: string, shot: ShotData): Promise<void> {
+  const id = `s_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  await update(ref(db(), `rooms/${roomId}/shots`), { [id]: shot });
+}
+
+export function subscribeToShots(
+  roomId: string,
+  callback: (shots: Record<string, ShotData>) => void,
+): () => void {
+  return onValue(ref(db(), `rooms/${roomId}/shots`), (snap) => callback(snap.val() ?? {}));
+}
+
+// Batched removal of consumed/expired shots (one write for many ids).
+export async function pruneShots(roomId: string, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const payload: Record<string, null> = {};
+  for (const id of ids) payload[id] = null;
+  await update(ref(db(), `rooms/${roomId}/shots`), payload);
+}
+
+// Atomic -1 to a victim's hp (safe under concurrent shooters — increment, not a
+// transaction, so it never aborts sibling writes).
+export async function damagePlayer(roomId: string, playerId: string): Promise<void> {
+  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { hp: increment(-1) });
+}
+
+export async function setPlayerHp(roomId: string, playerId: string, hp: number): Promise<void> {
+  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { hp });
 }
