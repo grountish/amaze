@@ -46,6 +46,8 @@
   const SHOT_RADIUS = 4;
   const FIRE_COOLDOWN = 380; // ms between shots
   const BUILD_COOLDOWN = 300; // ms between placed walls
+  const BOMB_COOLDOWN = 400; // ms between dropped bombs
+  const BOMB_START = 3; // bombs you spawn with / a purple nutrient grants
   const MAX_HP = 3; // hits to die
   const POSITION_SYNC_THROTTLE = 50;
 
@@ -93,6 +95,8 @@
   let consumedShots = new Set<string>(); // ids we've already resolved locally
   let lastShotAt = 0;
   let lastBuildAt = 0;
+  let lastBombAt = 0;
+  let bombCount = BOMB_START; // mines in inventory; drop with D, refill via purple nutrient
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
   let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
@@ -247,6 +251,28 @@
     updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
   }
 
+  // Drop a bomb (mine) in the cell BEHIND the ball — lethal to bots, harmless to
+  // humans. Costs one from the inventory; rate-limited. Armed instantly so a
+  // chasing zombie that crosses it dies right away.
+  function dropBomb() {
+    if (inputSource === 'bot' || !gameState || gameState.status !== 'playing' || !cellGrid) return;
+    if (bombCount <= 0) return;
+    if (Object.keys(traps).length >= 14) return; // trap node full — don't waste a bomb
+    const nowMs = Date.now();
+    if (nowMs - lastBombAt < BOMB_COOLDOWN) return;
+    const pcc = Math.floor(gameState.ball.position.x / CELL_SIZE);
+    const pcr = Math.floor(gameState.ball.position.y / CELL_SIZE);
+    // Place behind (opposite the aim heading); fall back to my own cell if that
+    // cell is a wall or off-grid.
+    let cc = pcc - lastHeading.x, cr = pcr - lastHeading.y;
+    if (cc < 0 || cr < 0 || cc >= GRID_COLS || cr >= GRID_ROWS || cellGrid.walls[cr * GRID_COLS + cc]) {
+      cc = pcc; cr = pcr;
+    }
+    lastBombAt = nowMs;
+    bombCount--;
+    addTrap(roomId, cc, cr, nowMs, 'bomb').catch(console.error);
+  }
+
   // The maze walls + Turing tint only change on the 1.5s evolution tick, not
   // per frame. Rasterise them once into this offscreen layer and blit it each
   // frame — avoids re-scanning all GRID_COLS×GRID_ROWS cells (and allocating an
@@ -345,7 +371,9 @@
         ctx.save();
         ctx.beginPath();
         ctx.arc(nx, ny, 5 * pulse, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
+        ctx.fillStyle = n.kind === 'bomb'
+          ? `rgba(190,70,255,${0.7 + 0.3 * pulse})` // purple = bomb refill
+          : `rgba(255,${160 + n.value * 25},0,${0.7 + 0.3 * pulse})`;
         ctx.fill();
         ctx.restore();
       }
@@ -356,7 +384,8 @@
         const ty = trap.row * CELL_SIZE + CELL_SIZE / 2;
         // Zombify traps read green (not a killer — they enrage the bots instead).
         const zomb = trap.kind === 'zombify';
-        const arming = trap.armAt != null && drawNow < trap.armAt;
+        const isBomb = trap.kind === 'bomb';
+        const arming = !isBomb && trap.armAt != null && drawNow < trap.armAt;
         if (arming) {
           // Telegraph: a ring closes in as the trap arms, so the danger is
           // visible from a distance well before it triggers.
@@ -390,6 +419,24 @@
           ctx.moveTo(tx + 3, ty);
           ctx.arc(tx, ty, 3, 0, Math.PI * 2);
           ctx.stroke();
+          ctx.restore();
+        } else if (isBomb) {
+          // Live bomb mine: dark sphere with a pulsing red glow + spark.
+          const pulse = 0.6 + 0.4 * Math.sin(drawNow / 140 + trap.col + trap.row);
+          ctx.save();
+          ctx.fillStyle = '#15151f';
+          ctx.beginPath();
+          ctx.arc(tx, ty, 6, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = `rgba(255,60,40,${0.6 + 0.4 * pulse})`;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(tx, ty, 7, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = `rgba(255,200,80,${0.5 + 0.5 * pulse})`;
+          ctx.beginPath();
+          ctx.arc(tx + 4, ty - 5, 1.6, 0, Math.PI * 2); // fuse spark
+          ctx.fill();
           ctx.restore();
         } else {
           const pulse = 0.7 + 0.3 * Math.sin(drawNow / 200 + trap.col + trap.row);
@@ -556,6 +603,14 @@
         ctx.restore();
       }
 
+      // Bomb inventory
+      if (inputSource !== 'bot') {
+        ctx.save();
+        ctx.fillStyle = bombCount > 0 ? '#c46bff' : '#665';
+        ctx.font = 'bold 15px monospace';
+        ctx.fillText(`💣 ${bombCount}`, 16, CANVAS_HEIGHT - 30);
+        ctx.restore();
+      }
     }
 
     // Death flash overlay
@@ -656,7 +711,10 @@
             evolveGrid(cellGrid, activeMaze); // also advances the Turing field
             mazeLayerDirty = true; // host: walls just changed
             updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
-            const candidates = findNutrientPositions(cellGrid, 3);
+            // One of the three is a bomb refill (purple) so players can restock.
+            const candidates = findNutrientPositions(cellGrid, 3).map((c, i) =>
+              i === 0 ? { ...c, kind: 'bomb' as const } : c,
+            );
             syncNutrients(roomId, candidates).catch(console.error);
 
             // Often place a trap on a hot-path cell — but never on top of a
@@ -695,8 +753,9 @@
           if (dx * dx + dy * dy < 484) {
             collectedNutrients.add(id);
             collectNutrient(roomId, id).then((ok) => {
-              if (ok) speedBoosts = [...speedBoosts, { expires: nowMs + 8000, factor: 1 + n.value * 0.2 }];
-              else collectedNutrients.delete(id);
+              if (!ok) { collectedNutrients.delete(id); return; }
+              if (n.kind === 'bomb') bombCount += BOMB_START; // purple → +3 mines
+              else speedBoosts = [...speedBoosts, { expires: nowMs + 8000, factor: 1 + n.value * 0.2 }];
             }).catch(console.error);
           }
         }
@@ -706,6 +765,7 @@
       if (gameState.status === 'playing') {
         for (const [id, trap] of Object.entries(traps)) {
           if (triggeredTraps.has(id)) continue;
+          if (trap.kind === 'bomb') continue; // bombs are anti-bot mines; humans pass through
           // Not lethal until armed — the warning ring gives you time to dodge.
           if (trap.armAt != null && nowMs < trap.armAt) continue;
           const tx = (trap.col + 0.5) * CELL_SIZE;
@@ -979,12 +1039,14 @@
       lastHeading = { x: Math.sign(s.x), y: Math.sign(s.y) };
     }
 
-    // Shoot with A, build a wall with S (any human). Movement is arrow-keys only.
+    // Shoot with A, build a wall with S, drop a bomb with D (any human).
+    // Movement is arrow-keys only.
     if (inputSource !== 'bot') {
       const onActionKey = (e: KeyboardEvent) => {
         const k = e.key.toLowerCase();
         if (k === 'a') fire();
         else if (k === 's') build();
+        else if (k === 'd') dropBomb();
       };
       window.addEventListener('keydown', onActionKey);
       cleanupFns.push(() => window.removeEventListener('keydown', onActionKey));
@@ -1321,6 +1383,11 @@
 
 {#if inputSource !== 'bot'}
   <button
+    class="bomb-btn"
+    on:pointerdown|preventDefault={dropBomb}
+    aria-label="Drop bomb"
+  >💣{bombCount}</button>
+  <button
     class="build-btn"
     on:pointerdown|preventDefault={build}
     aria-label="Build wall"
@@ -1409,5 +1476,27 @@
 
   .build-btn:active {
     background: rgba(60, 140, 220, 0.95);
+  }
+
+  .bomb-btn {
+    position: fixed;
+    right: 12.25rem;
+    bottom: 1.5rem;
+    width: 78px;
+    height: 78px;
+    border-radius: 50%;
+    border: 2px solid #c46bff;
+    background: rgba(110, 40, 160, 0.85);
+    color: #fff;
+    font-weight: 800;
+    font-size: 1rem;
+    letter-spacing: 0.02em;
+    touch-action: none;
+    user-select: none;
+    z-index: 40;
+  }
+
+  .bomb-btn:active {
+    background: rgba(150, 70, 210, 0.95);
   }
 </style>

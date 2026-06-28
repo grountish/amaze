@@ -44,6 +44,7 @@ export type NutrientData = {
   row: number;
   value: number;   // 1-3, controls boost magnitude
   expiresAt: number;
+  kind?: "bomb";   // undefined = speed boost (orange); "bomb" = +3 bombs (purple)
 };
 
 export function createCellGrid(): CellGrid {

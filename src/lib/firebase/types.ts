@@ -11,7 +11,9 @@ export type TrapData = {
   col: number;
   row: number;
   armAt?: number; // epoch ms when it becomes lethal; before that it only warns
-  kind?: "zombify"; // default (undefined) = lethal; "zombify" enrages all bots
+  // default (undefined) = lethal to humans; "zombify" enrages all bots;
+  // "bomb" = player-dropped mine, lethal to BOTS only (humans walk over it).
+  kind?: "zombify" | "bomb";
 };
 
 // A projectile. Immutable + time-derived: position = origin + dir·speed·age, so

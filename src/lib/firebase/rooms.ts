@@ -299,6 +299,7 @@ export async function advanceMaze(roomId: string): Promise<void> {
     set(ref(db(), `${base}/lap`), increment(1)),
     set(ref(db(), `${base}/mazeGrid`), null), // drop evolved deltas; fresh maze
     set(ref(db(), `${base}/rage`), false), // fresh maze clears any zombie rage
+    set(ref(db(), `${base}/traps`), null), // stale traps/bombs map to old walls
   ]);
 }
 
@@ -433,12 +434,12 @@ export async function addTrap(
   col: number,
   row: number,
   armAt: number,
-  kind?: "zombify",
+  kind?: "zombify" | "bomb",
 ): Promise<void> {
   const trapsRef = ref(db(), `rooms/${roomId}/traps`);
   const snap = await get(trapsRef);
   const existing: Record<string, TrapData> = snap.val() ?? {};
-  if (Object.keys(existing).length >= 8) return; // cap at 8
+  if (Object.keys(existing).length >= 14) return; // cap (AI traps + player bombs)
   const data: TrapData = { col, row, armAt };
   if (kind) data.kind = kind; // omit when undefined — RTDB rejects undefined
   await update(trapsRef, { [`t_${Date.now()}`]: data });
