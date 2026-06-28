@@ -7,9 +7,10 @@ function normalizeKey(key: string): string {
 }
 
 function updateInput(): void {
+  // Arrow keys only — A/S are reserved for shoot/build (see GameCanvas).
   input.set({
-    x: Number(keys.has("arrowright") || keys.has("d")) - Number(keys.has("arrowleft") || keys.has("a")),
-    y: Number(keys.has("arrowdown") || keys.has("s")) - Number(keys.has("arrowup") || keys.has("w")),
+    x: Number(keys.has("arrowright")) - Number(keys.has("arrowleft")),
+    y: Number(keys.has("arrowdown")) - Number(keys.has("arrowup")),
   });
 }
 

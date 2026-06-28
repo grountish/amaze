@@ -45,6 +45,7 @@
   const SHOT_TTL = 1400; // ms before a shot expires
   const SHOT_RADIUS = 4;
   const FIRE_COOLDOWN = 380; // ms between shots
+  const BUILD_COOLDOWN = 300; // ms between placed walls
   const MAX_HP = 3; // hits to die
   const POSITION_SYNC_THROTTLE = 50;
 
@@ -91,6 +92,7 @@
   let shots: Record<string, ShotData> = {};
   let consumedShots = new Set<string>(); // ids we've already resolved locally
   let lastShotAt = 0;
+  let lastBuildAt = 0;
   let lastHeading = { x: 1, y: 0 }; // aim fallback when standing still
   const WALL_HP = 3; // shots to break a wall cell
   let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
@@ -219,6 +221,30 @@
       y: gameState.ball.position.y + dy * (gameState.ball.radius + SHOT_RADIUS + 1),
       dx, dy, firedAt: nowMs,
     }).catch(console.error);
+  }
+
+  // Build a wall in the cell directly ahead (aim direction). Rate-limited.
+  // Breakable like a normal wall; broadcast so every client sees it.
+  function build() {
+    if (inputSource === 'bot' || !gameState || gameState.status !== 'playing' || !cellGrid) return;
+    const nowMs = Date.now();
+    if (nowMs - lastBuildAt < BUILD_COOLDOWN) return;
+    // One cell ahead of the player's cell, in the unit-cardinal aim heading.
+    const pcc = Math.floor(gameState.ball.position.x / CELL_SIZE);
+    const pcr = Math.floor(gameState.ball.position.y / CELL_SIZE);
+    const cc = pcc + lastHeading.x, cr = pcr + lastHeading.y;
+    if (cc < 0 || cr < 0 || cc >= GRID_COLS || cr >= GRID_ROWS) return;
+    const ci = cr * GRID_COLS + cc;
+    if (cellGrid.walls[ci]) return; // already a wall
+    // Never seal a base.
+    const startCi = Math.floor(activeMaze.startPosition.y / CELL_SIZE) * GRID_COLS + Math.floor(activeMaze.startPosition.x / CELL_SIZE);
+    const holeCi = Math.floor(activeMaze.hole.y / CELL_SIZE) * GRID_COLS + Math.floor(activeMaze.hole.x / CELL_SIZE);
+    if (ci === startCi || ci === holeCi) return;
+    lastBuildAt = nowMs;
+    cellGrid.walls[ci] = 1;
+    cellGrid.hardness[ci] = 2; // breakable like a normal interior wall
+    mazeLayerDirty = true;
+    updateMazeGrid(roomId, serializeWalls(cellGrid.walls)).catch(console.error);
   }
 
   // The maze walls + Turing tint only change on the 1.5s evolution tick, not
@@ -951,13 +977,15 @@
       lastHeading = { x: Math.sign(s.x), y: Math.sign(s.y) };
     }
 
-    // Fire with Space (any human). preventDefault stops the page scrolling.
+    // Shoot with A, build a wall with S (any human). Movement is arrow-keys only.
     if (inputSource !== 'bot') {
-      const onFireKey = (e: KeyboardEvent) => {
-        if (e.code === 'Space') { e.preventDefault(); fire(); }
+      const onActionKey = (e: KeyboardEvent) => {
+        const k = e.key.toLowerCase();
+        if (k === 'a') fire();
+        else if (k === 's') build();
       };
-      window.addEventListener('keydown', onFireKey);
-      cleanupFns.push(() => window.removeEventListener('keydown', onFireKey));
+      window.addEventListener('keydown', onActionKey);
+      cleanupFns.push(() => window.removeEventListener('keydown', onActionKey));
     }
 
     if (inputSource === 'keyboard') {
@@ -1291,6 +1319,11 @@
 
 {#if inputSource !== 'bot'}
   <button
+    class="build-btn"
+    on:pointerdown|preventDefault={build}
+    aria-label="Build wall"
+  >BUILD</button>
+  <button
     class="fire-btn"
     on:pointerdown|preventDefault={fire}
     aria-label="Shoot"
@@ -1352,5 +1385,27 @@
 
   .fire-btn:active {
     background: rgba(255, 120, 40, 0.95);
+  }
+
+  .build-btn {
+    position: fixed;
+    right: 6.75rem;
+    bottom: 1.5rem;
+    width: 78px;
+    height: 78px;
+    border-radius: 50%;
+    border: 2px solid #4ec0ff;
+    background: rgba(30, 90, 160, 0.85);
+    color: #fff;
+    font-weight: 800;
+    font-size: 0.9rem;
+    letter-spacing: 0.04em;
+    touch-action: none;
+    user-select: none;
+    z-index: 40;
+  }
+
+  .build-btn:active {
+    background: rgba(60, 140, 220, 0.95);
   }
 </style>
