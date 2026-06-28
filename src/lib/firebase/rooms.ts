@@ -50,7 +50,6 @@ export async function createRoom(playerName: string, inputSource: InputSource): 
     ready: false,
     online: true,
     inputSource,
-    progress: 0,
     lastSeenAt: now,
   };
 
@@ -146,7 +145,6 @@ export async function joinRoom(roomId: string, playerName: string, inputSource: 
     ready: false,
     online: true,
     inputSource,
-    progress: 0,
     lastSeenAt: now,
     hp: 3,
   };
@@ -236,24 +234,17 @@ export async function setPlayerReady(roomId: string, playerId: string, ready: bo
   await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { ready });
 }
 
-export async function updatePlayerProgress(roomId: string, playerId: string, progress: number): Promise<void> {
-  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { progress, lastSeenAt: Date.now() });
-}
-
 export async function updatePlayerPosition(
   roomId: string,
   playerId: string,
   x: number,
   y: number,
-  progress: number,
 ): Promise<void> {
   // RTDB rejects NaN/Infinity — never write a corrupted position.
   if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-  const prog = Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : 0;
   await update(ref(db(), `rooms/${roomId}/players/${playerId}`), {
     x: Math.round(x),
     y: Math.round(y),
-    progress: prog,
     lastSeenAt: Date.now(),
   });
 }
@@ -264,17 +255,15 @@ export async function updatePlayerPosition(
 // → one echo, regardless of bot count.
 export async function updateBotPositions(
   roomId: string,
-  updates: { id: string; x: number; y: number; progress: number }[],
+  updates: { id: string; x: number; y: number }[],
 ): Promise<void> {
   if (updates.length === 0) return;
   const now = Date.now();
   const payload: Record<string, number> = {};
   for (const u of updates) {
     if (!Number.isFinite(u.x) || !Number.isFinite(u.y)) continue;
-    const prog = Number.isFinite(u.progress) ? Math.max(0, Math.min(100, u.progress)) : 0;
     payload[`${u.id}/x`] = Math.round(u.x);
     payload[`${u.id}/y`] = Math.round(u.y);
-    payload[`${u.id}/progress`] = prog;
     payload[`${u.id}/lastSeenAt`] = now;
   }
   await update(ref(db(), `rooms/${roomId}/players`), payload);
@@ -283,19 +272,6 @@ export async function updateBotPositions(
 export async function sendGameEvent(roomId: string, event: GameEvent): Promise<void> {
   const eventsRef = ref(db(), `rooms/${roomId}/events`);
   await push(eventsRef, event);
-}
-
-export async function finishPlayer(roomId: string, playerId: string, timeMs: number): Promise<void> {
-  const now = Date.now();
-  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), {
-    progress: 100,
-    finishedAt: now,
-  });
-
-  const roomRef = ref(db(), `rooms/${roomId}`);
-  await update(roomRef, { status: "finished", winnerId: playerId, finishedAt: now });
-
-  await sendGameEvent(roomId, { type: "GOAL_REACHED", playerId, timeMs, createdAt: now });
 }
 
 export async function setRoomStatus(roomId: string, status: Room["status"]): Promise<void> {
@@ -345,7 +321,6 @@ export async function addBotPlayer(roomId: string): Promise<string> {
     ready: true,
     online: true,
     inputSource: "bot",
-    progress: 0,
     lastSeenAt: now,
     hp: 3,
   };

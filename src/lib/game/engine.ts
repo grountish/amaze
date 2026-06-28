@@ -8,7 +8,6 @@ export function createInitialGameState(maze: Maze): LocalGameState {
       radius: 9,
     },
     status: "idle",
-    progress: 0,
   };
 }
 
@@ -37,31 +36,17 @@ export function updateGame(
   const nextState: LocalGameState = {
     ...state,
     ball: { ...state.ball, position, velocity },
-    progress: calculateProgress(position, maze),
   };
 
   if (isInsideHole(position, state.ball.radius, maze)) {
     return {
       ...nextState,
       status: "finished",
-      progress: 100,
       finishedAt: Date.now(),
     };
   }
 
   return resolveWallCollisions(nextState, maze);
-}
-
-function calculateProgress(position: { x: number; y: number }, maze: Maze): number {
-  const dx = maze.hole.x - maze.startPosition.x;
-  const dy = maze.hole.y - maze.startPosition.y;
-  const totalDistance = Math.sqrt(dx * dx + dy * dy) || 1; // avoid /0 → NaN
-
-  const currentDx = position.x - maze.startPosition.x;
-  const currentDy = position.y - maze.startPosition.y;
-  const currentDistance = Math.sqrt(currentDx * currentDx + currentDy * currentDy);
-
-  return Math.min(100, Math.max(0, (currentDistance / totalDistance) * 100));
 }
 
 function isInsideHole(position: { x: number; y: number }, radius: number, maze: Maze): boolean {

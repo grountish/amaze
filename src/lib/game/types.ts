@@ -48,7 +48,6 @@ export type Maze = {
 export type LocalGameState = {
   ball: BallState;
   status: "idle" | "playing" | "finished";
-  progress: number;
   startedAt?: number;
   finishedAt?: number;
 };

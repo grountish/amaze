@@ -121,7 +121,6 @@
   // Last-seen human positions + smoothed velocity (id → …) so zombies can lead
   // the target instead of chasing where it already left.
   const humanTrack = new Map<string, { x: number; y: number; t: number; vx: number; vy: number }>();
-  let lastKnownProgress = 0;
   let lastFrameTime: number = 0;
 
   function getPlayerColor(pid: string): string {
@@ -403,16 +402,9 @@
     const lerpFactor = 1 - Math.exp(-12 * deltaTime);
     for (const player of allPlayers) {
       if (player.id === playerId) continue;
-      let targetX: number;
-      let targetY: number;
-      if (player.x != null && player.y != null) {
-        targetX = player.x;
-        targetY = player.y;
-      } else {
-        const t = (player.progress ?? 0) / 100;
-        targetX = maze.startPosition.x + (maze.hole.x - maze.startPosition.x) * t;
-        targetY = maze.startPosition.y + (maze.hole.y - maze.startPosition.y) * t;
-      }
+      if (player.x == null || player.y == null) continue; // no position synced yet
+      const targetX = player.x;
+      const targetY = player.y;
       const prev = opponentDisplayPos.get(player.id) ?? { x: targetX, y: targetY };
       const px = prev.x + (targetX - prev.x) * lerpFactor;
       const py = prev.y + (targetY - prev.y) * lerpFactor;
@@ -485,10 +477,6 @@
 
     // HUD — bottom bar
     if (gameState) {
-      ctx.fillStyle = '#ffffff';
-      ctx.font = '16px monospace';
-      ctx.fillText(`Progress: ${Math.round(gameState.progress)}%`, 30, CANVAS_HEIGHT - 30);
-
       // Speed boost indicator
       const now_hud = Date.now();
       const activeBoosts = speedBoosts.filter((b) => b.expires > now_hud);
@@ -563,7 +551,7 @@
     const deltaTime = Math.min((now - lastFrameTime) / 1000, 0.05);
     lastFrameTime = now;
 
-    // Bot skips physics — progress is driven by startBotProgressLoop
+    // A local bot drives its own input loop (set up in onMount); skip human physics.
     if (inputSource !== 'bot') {
       const currentInput = get(input);
       const nowMs = Date.now();
@@ -667,7 +655,6 @@
                 position: { ...activeMaze.startPosition },
                 velocity: { x: 0, y: 0 },
               },
-              progress: 0,
             };
           }
         }
@@ -730,7 +717,6 @@
         gameState = {
           ...gameState,
           ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
-          progress: 0,
         };
         setPlayerHp(roomId, playerId, MAX_HP).catch(console.error);
       }
@@ -749,7 +735,6 @@
             gameState = {
               ...gameState,
               ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
-              progress: 0,
             };
             break;
           }
@@ -798,16 +783,15 @@
       }
       localGame.set(gameState);
 
-      // Sync position + progress to Firebase at ~20fps, skip if barely moved
+      // Sync position to Firebase at ~20fps, skip if barely moved
       if (now - lastProgressSync > POSITION_SYNC_THROTTLE) {
         const { x, y } = gameState.ball.position;
         const dx = x - lastSyncedPos.x;
         const dy = y - lastSyncedPos.y;
         if (dx * dx + dy * dy >= 4) {
           lastProgressSync = now;
-          lastKnownProgress = gameState.progress;
           lastSyncedPos = { x, y };
-          updatePlayerPosition(roomId, playerId, x, y, gameState.progress).catch(console.error);
+          updatePlayerPosition(roomId, playerId, x, y).catch(console.error);
         }
       }
 
@@ -828,7 +812,6 @@
           ...gameState,
           ball: { ...gameState.ball, position: { ...activeMaze.startPosition }, velocity: { x: 0, y: 0 } },
           status: 'playing',
-          progress: 0,
         };
         localGame.set(gameState);
       }
@@ -1031,7 +1014,7 @@
       }
 
       // Collect every bot's new position and flush as ONE write at the end.
-      const botWrites: { id: string; x: number; y: number; progress: number }[] = [];
+      const botWrites: { id: string; x: number; y: number }[] = [];
 
       for (const bot of bots) {
         let state = botAIStates.get(bot.id);
@@ -1067,7 +1050,7 @@
           state = { ...state, physics: { x: hx, y: hy, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
           botAIStates.set(bot.id, state);
           setPlayerHp(roomId, bot.id, MAX_HP).catch(console.error);
-          botWrites.push({ id: bot.id, x: hx, y: hy, progress: 0 });
+          botWrites.push({ id: bot.id, x: hx, y: hy });
           continue;
         }
 
@@ -1194,7 +1177,7 @@
         // Bot deposits pheromone
         depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.1);
 
-        botWrites.push({ id: bot.id, x: state.physics.x, y: state.physics.y, progress });
+        botWrites.push({ id: bot.id, x: state.physics.x, y: state.physics.y });
         botAIStates.set(bot.id, state);
       }
 

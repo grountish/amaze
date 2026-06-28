@@ -12,7 +12,7 @@
     }
     if (aFinished) return -1;
     if (bFinished) return 1;
-    return b.progress - a.progress;
+    return (b.score ?? 0) - (a.score ?? 0);
   });
 
   function formatTime(ms: number): string {
@@ -44,12 +44,7 @@
                 <span class="finish-time">{formatTime(player.finishedAt)}</span>
               {/if}
             </div>
-            <div class="progress-track">
-              <div
-                class="progress-fill"
-                style="width: {Math.min(100, Math.max(0, player.progress * 100))}%"
-              ></div>
-            </div>
+            <div class="score-line">{player.score ?? 0} {(player.score ?? 0) === 1 ? 'lap' : 'laps'}</div>
           </div>
         </li>
       {/each}
@@ -152,17 +147,8 @@
     margin-left: auto;
   }
 
-  .progress-track {
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(255, 255, 255, 0.1);
-    overflow: hidden;
-  }
-
-  .progress-fill {
-    height: 100%;
-    border-radius: 3px;
-    background: linear-gradient(90deg, #6366f1, #8b5cf6);
-    transition: width 0.3s ease;
+  .score-line {
+    font-size: 0.8rem;
+    color: rgba(255, 255, 255, 0.6);
   }
 </style>

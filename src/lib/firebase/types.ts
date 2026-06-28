@@ -46,7 +46,6 @@ export type Player = {
   ready: boolean;
   online: boolean;
   inputSource: InputSource;
-  progress: number;
   x?: number;
   y?: number;
   finishedAt?: number;
@@ -59,13 +58,6 @@ export type GameEvent =
   | {
       type: "PLAYER_READY";
       playerId: string;
-      createdAt: number;
-    }
-  | {
-      type: "CHECKPOINT_REACHED";
-      playerId: string;
-      checkpointId: string;
-      progress: number;
       createdAt: number;
     }
   | {
