@@ -358,6 +358,7 @@
               <div class="keyrow"><kbd>A</kbd><span>Shoot where you're facing</span></div>
               <div class="keyrow"><kbd>S</kbd><span>Build a wall in front of you</span></div>
               <div class="keyrow"><kbd>D</kbd><span>Drop a bomb behind you (kills bots)</span></div>
+              <div class="keyrow"><kbd>M</kbd><span>Play / pause the radio</span></div>
             </div>
             <div class="scheme">
               <div class="scheme-head">

@@ -1,6 +1,7 @@
 <script lang="ts">
   import RoomLobby from '$lib/components/RoomLobby.svelte';
   import GameScreen from '$lib/components/GameScreen.svelte';
+  import RadioPlayer from '$lib/components/RadioPlayer.svelte';
   import { debugMode } from '$lib/stores/gameStore';
   import { initAuth } from '$lib/firebase/auth';
   import { ensureRoom, joinRoom, SINGLE_ROOM_ID } from '$lib/firebase/rooms';
@@ -58,6 +59,9 @@
     autoJoin();
   }
 </script>
+
+<!-- Mounted once, outside the screen switch, so the music survives lobby ↔ game. -->
+<RadioPlayer placement={screen === "game" ? "game" : "lobby"} />
 
 {#if screen === "loading"}
   <div class="splash">
