@@ -1584,6 +1584,14 @@
     background: rgba(60, 140, 220, 0.95);
   }
 
+  /* Touch-only controls: desktop (mouse + hover) uses keyboard shortcuts. */
+  @media (hover: hover) and (pointer: fine) {
+    .build-btn,
+    .fire-btn {
+      display: none;
+    }
+  }
+
   /* Stats live in the black margin below the maze, never over it. */
   .stats-panel {
     position: fixed;
