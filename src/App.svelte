@@ -61,17 +61,18 @@
 
 {#if screen === "loading"}
   <div class="splash">
-    <h1>Amaze</h1>
+    <h1>AMAZE</h1>
     {#if error}
-      <p class="error">{error}</p>
-      <button class="retry" on:click={autoJoin}>Retry</button>
+      <p class="error">Couldn't connect: {error}</p>
+      <button class="retry" on:click={autoJoin}>Try again</button>
     {:else}
-      <p class="hint">Joining…</p>
+      <div class="spinner" aria-hidden="true" />
+      <p class="hint">Joining the lobby…</p>
     {/if}
   </div>
 {/if}
 {#if screen === "lobby"}
-  <RoomLobby {roomId} {playerName} {inputSource} on:start={handleStart} />
+  <RoomLobby {roomId} {playerName} {inputSource} on:start={handleStart} on:rename={(e) => (playerName = e.detail)} />
 {/if}
 {#if screen === "game"}
   <GameScreen {roomId} {playerName} {inputSource} on:home={handleHome} />
@@ -93,18 +94,27 @@
   }
   .splash h1 {
     font-size: 3rem;
-    font-weight: 800;
-    letter-spacing: 0.1em;
+    font-weight: 900;
+    letter-spacing: 0.14em;
     color: #fff;
   }
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid #2a2a4c;
+    border-top-color: #7c7cff;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .hint { color: #8888aa; }
   .error { color: #ff6b6b; text-align: center; max-width: 320px; }
   .retry {
     padding: 0.6rem 1.5rem;
     border: none;
     border-radius: 8px;
-    background: #3333aa;
-    color: #fff;
-    font-weight: 600;
+    background: #7c7cff;
+    color: #0b0b1a;
+    font-weight: 700;
   }
 </style>

@@ -234,6 +234,10 @@ export async function setPlayerReady(roomId: string, playerId: string, ready: bo
   await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { ready });
 }
 
+export async function setPlayerName(roomId: string, playerId: string, name: string): Promise<void> {
+  await update(ref(db(), `rooms/${roomId}/players/${playerId}`), { name });
+}
+
 export async function updatePlayerPosition(
   roomId: string,
   playerId: string,
