@@ -110,7 +110,7 @@
     <div class="scoreboard">
       <div class="sb-title">Laps</div>
       {#each scores as p (p.id)}
-        <div class="sb-row" class:me={p.id === playerId}>
+        <div class="sb-row" class:me={p.id === playerId} class:ally={p.team === 'ally'}>
           <span class="sb-name">{p.name}</span>
           <span class="sb-score">{p.score ?? 0}</span>
         </div>
@@ -160,6 +160,7 @@
     padding: 0.1rem 0;
   }
   .sb-row.me .sb-name { color: #6ad06a; font-weight: 600; }
+  .sb-row.ally .sb-name { color: #7fb2ff; }
   .sb-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
   .sb-score { font-variant-numeric: tabular-nums; font-weight: 700; }
 

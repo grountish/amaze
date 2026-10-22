@@ -56,6 +56,7 @@
   const POSITION_SYNC_THROTTLE = 50;
 
   const PLAYER_COLORS = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dda0dd'];
+  const ALLY_COLOR = '#3d8bff';
 
   let canvas: HTMLCanvasElement;
   let gameState: LocalGameState;
@@ -110,7 +111,8 @@
   const WALL_HP = 3; // shots to break a wall cell
   let wallHits = new Map<number, number>(); // cellIndex → my hits so far (local)
   let armoredHit = new Set<number>(); // armored cells I've shot (local, turn red)
-  let allZombies = false; // zombify-trap rage: every bot is a zombie (room-driven)
+  let rageUntil = 0; // zombify-trap rage: every bot is a zombie until this epoch ms (room-driven)
+  let allyIds = new Set<string>(); // bots on the humans' team (from player.team)
 
   // Player death / respawn
   let deathFlashUntil = 0;
@@ -129,12 +131,18 @@
   };
   const botAIStates = new Map<string, BotAIState>();
 
+  const RAGE_MS = 60_000; // zombify-trap rage lasts at most 1 minute
+
   // Zombies don't wander: pure path-follow, no pheromone drift, no random
   // deviation — a relentless beeline toward the prey.
   const ZOMBIE_GENOME: BotGenome = {
     pathWeight: 1, pheroWeight: 0, exploreRate: 0,
     generation: 1, deaths: 0, bestProgress: 0,
   };
+  // Ally escorts: hunt zombies within this radius, otherwise race to the hole.
+  // Touching any enemy bot is a trade — both respawn at their own base.
+  const ESCORT_RANGE = 320; // px
+  const ALLY_REACH = 18; // px, bot-to-bot contact distance
   // Last-seen human positions + smoothed velocity (id → …) so zombies can lead
   // the target instead of chasing where it already left.
   const humanTrack = new Map<string, { x: number; y: number; t: number; vx: number; vy: number }>();
@@ -153,7 +161,8 @@
   // racing. Derived purely from the bot id (hash parity) so the host AI and
   // every client agree with zero extra network — no stored role field.
   function isZombie(id: string): boolean {
-    if (allZombies) return true; // zombify-trap rage: everyone hunts
+    if (allyIds.has(id)) return false; // allies never turn, not even in a rage
+    if (rageUntil && Date.now() < rageUntil) return true; // zombify-trap rage: everyone hunts
     let hash = 0;
     for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) & 0xffffffff;
     return (Math.abs(hash) & 1) === 0;
@@ -550,7 +559,9 @@
 
       // Zombie bots get a blood-red look so the player can read the threat.
       const zombie = player.inputSource === 'bot' && isZombie(player.id);
-      const color = zombie ? '#e0241c' : getPlayerColor(player.id);
+      // Allies: team blue with a white ring, so they read as friendly at a glance.
+      const ally = allyIds.has(player.id);
+      const color = zombie ? '#e0241c' : ally ? ALLY_COLOR : getPlayerColor(player.id);
       // Damage = fade: each shot drops a third of opacity (1 → 2/3 → 1/3 → gone).
       const hpFrac = Math.max(0, Math.min(1, (player.hp ?? MAX_HP) / MAX_HP));
       ctx.globalAlpha = hpFrac;
@@ -558,7 +569,7 @@
       ctx.arc(px, py, 9, 0, Math.PI * 2);
       ctx.fillStyle = color;
       ctx.fill();
-      ctx.strokeStyle = zombie ? '#6e0a06' : color;
+      ctx.strokeStyle = zombie ? '#6e0a06' : ally ? '#ffffff' : color;
       ctx.lineWidth = 2;
       ctx.stroke();
       ctx.globalAlpha = 1;
@@ -837,8 +848,8 @@
             triggeredTraps.add(id);
             triggerTrap(roomId, id).catch(console.error);
             if (trap.kind === 'zombify') {
-              // Not lethal — enrages every bot until the maze morphs.
-              setRage(roomId, true).catch(console.error);
+              // Not lethal — enrages every bot for RAGE_MS (or until the maze morphs).
+              setRage(roomId, Date.now() + RAGE_MS).catch(console.error);
               lapFlash = 'ZOMBIES ENRAGED!';
               if (lapFlashTimer) clearTimeout(lapFlashTimer);
               lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
@@ -901,6 +912,7 @@
           let hit = false;
           for (const pl of get(players)) {
             if (pl.id === playerId || pl.x == null || pl.y == null) continue;
+            if (allyIds.has(pl.id)) continue; // no friendly fire: shots pass through allies
             const ddx = pl.x - p.x, ddy = pl.y - p.y;
             const rr = 9 + SHOT_RADIUS;
             if (ddx * ddx + ddy * ddy < rr * rr) {
@@ -1052,7 +1064,7 @@
     onWater = false; // fresh maze ⇒ reset water-entry tracking
     wallHits.clear(); // wall damage doesn't carry to a fresh maze
     armoredHit.clear(); // armored reveals reset on a fresh maze
-    allZombies = false; // fresh maze clears rage locally (authoritative reset in advanceMaze)
+    rageUntil = 0; // fresh maze clears rage locally (authoritative reset in advanceMaze)
     mazeLayerDirty = true; // brand-new maze ⇒ re-rasterise
     // Reset local ball to start
     if (gameState) {
@@ -1064,8 +1076,10 @@
       localGame.set(gameState);
     }
     // Reset all bots to start; new maze ⇒ fresh hazard map (old deaths are stale)
-    for (const st of botAIStates.values()) {
-      st.physics = { x: activeMaze.hole.x, y: activeMaze.hole.y, vx: 0, vy: 0 }; // bots spawn at the hole
+    for (const [id, st] of botAIStates) {
+      // Enemies spawn at the hole (their lair); allies at the human's home.
+      const spawn = allyIds.has(id) ? activeMaze.startPosition : activeMaze.hole;
+      st.physics = { x: spawn.x, y: spawn.y, vx: 0, vy: 0 };
 
       st.path = null;
       st.waypointIdx = 0;
@@ -1164,7 +1178,7 @@
       // morph the maze, so normal play keeps the same (evolving) maze.
       subscribeToRoom(roomId, (r) => {
         if (!r) return;
-        allZombies = !!r.rage; // zombify-trap rage flag (cleared on morph)
+        rageUntil = typeof r.rageUntil === 'number' ? r.rageUntil : 0; // zombify-trap rage expiry (cleared on morph)
         currentLap = r.lap ?? 0; // drives theme rotation; set before applyMaze
         const seed = seedFromMazeId(r.mazeId);
         if (seed !== currentSeed) {
@@ -1207,13 +1221,16 @@
 
       subscribeToPlayers(roomId, (p) => {
         players.set(p);
+        allyIds = new Set(p.filter((pl) => pl.inputSource === 'bot' && pl.team === 'ally').map((pl) => pl.id));
         for (const pl of p) {
           // Init bot AI state as soon as we see a bot
           if (pl.inputSource === 'bot' && pl.id !== playerId && !botAIStates.has(pl.id)) {
+            // Battle mode: enemies spawn at the hole and race toward the human's
+            // start; allies run the human's route (start → hole).
+            const spawn = pl.team === 'ally' ? activeMaze.startPosition : activeMaze.hole;
             botAIStates.set(pl.id, {
               genome: defaultGenome(),
-              // Battle mode: bots spawn at the hole and race toward the human's start.
-              physics: { x: activeMaze.hole.x, y: activeMaze.hole.y, vx: 0, vy: 0 },
+              physics: { x: spawn.x, y: spawn.y, vx: 0, vy: 0 },
               path: null,
               waypointIdx: 0,
               lastProgress: 0,
@@ -1255,6 +1272,9 @@
 
       // Collect every bot's new position and flush as ONE write at the end.
       const botWrites: { id: string; x: number; y: number }[] = [];
+      // Team split once per tick (allies scan these instead of re-hashing ids).
+      const enemyBots = allyIds.size ? bots.filter((b) => !allyIds.has(b.id)) : bots;
+      const zombieBots = allyIds.size ? enemyBots.filter((b) => isZombie(b.id)) : [];
 
       for (const bot of bots) {
         let state = botAIStates.get(bot.id);
@@ -1262,11 +1282,16 @@
 
         const hx = activeMaze.hole.x, hy = activeMaze.hole.y;
         const sx = activeMaze.startPosition.x, sy = activeMaze.startPosition.y;
+        // Allies run the human's route (start → hole); enemies the reverse.
+        const ally = allyIds.has(bot.id);
+        const homeX = ally ? sx : hx, homeY = ally ? sy : hy; // spawn / respawn
+        const destX = ally ? hx : sx, destY = ally ? hy : sy; // race goal
 
-        // Zombies hunt the nearest live human; racers head for the human's start.
+        // Zombies hunt the nearest live human; racers head for their goal;
+        // allies hunt a nearby zombie, else race to the hole.
         const zombie = isZombie(bot.id);
-        let goalX = sx, goalY = sy;   // BFS goal (racer: start; zombie: lead point)
-        let preyX = 0, preyY = 0;     // nearest human's live pos (for LOS lunge)
+        let goalX = destX, goalY = destY; // BFS goal (racer: dest; hunter: prey)
+        let preyX = 0, preyY = 0;     // prey's live pos (for LOS lunge)
         let hasPrey = false;
         if (zombie && humans.length) {
           let best = Infinity, prey = humans[0];
@@ -1283,39 +1308,51 @@
           const LEAD = 0.35; // seconds of look-ahead
           goalX = Math.max(0, Math.min(WORLD_WIDTH - 1, preyX + (tr ? tr.vx : 0) * LEAD));
           goalY = Math.max(0, Math.min(WORLD_HEIGHT - 1, preyY + (tr ? tr.vy : 0) * LEAD));
+        } else if (ally) {
+          let best = ESCORT_RANGE * ESCORT_RANGE;
+          for (const z of zombieBots) {
+            const zs = botAIStates.get(z.id);
+            if (!zs) continue;
+            const ddx = zs.physics.x - state.physics.x, ddy = zs.physics.y - state.physics.y;
+            const d = ddx * ddx + ddy * ddy;
+            if (d < best) { best = d; preyX = zs.physics.x; preyY = zs.physics.y; hasPrey = true; }
+          }
+          if (hasPrey) { goalX = preyX; goalY = preyY; }
         }
 
         // Shot down (hp ran out) → respawn at start with fresh hp.
         if (bot.hp != null && bot.hp <= 0) {
-          state = { ...state, physics: { x: hx, y: hy, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
+          state = { ...state, physics: { x: homeX, y: homeY, vx: 0, vy: 0 }, path: null, waypointIdx: 0 };
           botAIStates.set(bot.id, state);
           setPlayerHp(roomId, bot.id, MAX_HP).catch(console.error);
-          botWrites.push({ id: bot.id, x: hx, y: hy });
+          botWrites.push({ id: bot.id, x: homeX, y: homeY });
           continue;
         }
 
-        // Bot progress = how far it's travelled from its spawn (the hole) toward
-        // the human's start, which is its goal.
-        const dpx = state.physics.x - hx, dpy = state.physics.y - hy;
+        // Bot progress = how far it's travelled from its spawn toward its goal
+        // (enemy: hole → human's start; ally: start → hole).
+        const dpx = state.physics.x - homeX, dpy = state.physics.y - homeY;
         const totalDist = Math.sqrt((hx - sx) ** 2 + (hy - sy) ** 2) || 1; // avoid /0
         const progress = Math.min(100, (Math.sqrt(dpx * dpx + dpy * dpy) / totalDist) * 100);
-        const dGx = state.physics.x - sx, dGy = state.physics.y - sy;
+        const dGx = state.physics.x - destX, dGy = state.physics.y - destY;
+        // An ally on the hunt isn't racing — don't let the stuck check punish it.
+        if (ally && hasPrey) state.lastProgressTime = nowMs;
 
-        // Reached the goal (the human's start)? Any bot — zombie or racer —
-        // scores and wins; the first finisher of the round advances the maze
-        // for everyone (gated). Then reset that bot back to its lair.
+        // Reached the goal? Any bot — zombie, racer or ally — scores and wins;
+        // the first finisher of the round advances the maze for everyone
+        // (gated). Then reset that bot back to its base.
         if (Math.sqrt(dGx * dGx + dGy * dGy) < 16) {
           scoreLap(roomId, bot.id).catch(console.error);
           if (!lapWinSent) {
             lapWinSent = true;
             advanceMaze(roomId).catch(console.error);
-            lapFlash = 'New maze!';
+            lapFlash = ally ? 'Your ally scored!' : 'New maze!';
             if (lapFlashTimer) clearTimeout(lapFlashTimer);
             lapFlashTimer = setTimeout(() => { lapFlash = ''; }, 1600);
           }
           state = {
             ...state,
-            physics: { x: hx, y: hy, vx: 0, vy: 0 },
+            physics: { x: homeX, y: homeY, vx: 0, vy: 0 },
             path: null,
             waypointIdx: 0,
             lastProgress: 0,
@@ -1329,6 +1366,7 @@
         let hitTrap = false;
         for (const [trapId, trap] of Object.entries(traps)) {
           if (trap.kind === 'zombify') continue; // bots ignore zombify traps (human-only)
+          if (ally && trap.kind === 'bomb') continue; // player mines spare allies
           const tx = (trap.col + 0.5) * CELL_SIZE, ty = (trap.row + 0.5) * CELL_SIZE;
           const ddx = state.physics.x - tx, ddy = state.physics.y - ty;
           if (ddx * ddx + ddy * ddy < 400) {
@@ -1337,7 +1375,7 @@
             const newGenome = mutate(state.genome, progress);
             state = {
               genome: newGenome,
-              physics: { x: hx, y: hy, vx: 0, vy: 0 },
+              physics: { x: homeX, y: homeY, vx: 0, vy: 0 },
               path: null,
               waypointIdx: 0,
               lastProgress: 0,
@@ -1362,7 +1400,7 @@
           recordDeath(state.hazard, state.physics.x, state.physics.y);
           state = {
             genome: mutate(state.genome, progress),
-            physics: { x: hx, y: hy, vx: 0, vy: 0 },
+            physics: { x: homeX, y: homeY, vx: 0, vy: 0 },
             path: null,
             waypointIdx: 0,
             lastProgress: 0,
@@ -1385,7 +1423,7 @@
           const newGenome = mutate(state.genome, progress);
           state = {
             genome: newGenome,
-            physics: { x: hx, y: hy, vx: 0, vy: 0 },
+            physics: { x: homeX, y: homeY, vx: 0, vy: 0 },
             path: null,
             waypointIdx: 0,
             lastProgress: 0,
@@ -1409,10 +1447,10 @@
         // lunge and falls back to planning toward its last lead point.
         const lx = preyX - state.physics.x, ly = preyY - state.physics.y;
         const LOS_RANGE = 420; // px
-        const preyHidden = hasPrey &&
+        const preyHidden = zombie && hasPrey &&
           cellGrid.terrain[Math.floor(preyY / CELL_SIZE) * GRID_COLS + Math.floor(preyX / CELL_SIZE)] === TERRAIN.FOREST;
         if (
-          zombie && hasPrey && !preyHidden &&
+          (zombie || ally) && hasPrey && !preyHidden &&
           lx * lx + ly * ly < LOS_RANGE * LOS_RANGE &&
           hasLineOfSight(cellGrid, state.physics.x, state.physics.y, preyX, preyY)
         ) {
@@ -1427,10 +1465,10 @@
           if (!state.path || nowMs >= state.replanAt) {
             state.path = bfsPath(cellGrid, state.physics.x, state.physics.y, goalX, goalY, state.hazard, state.known);
             state.waypointIdx = 0;
-            state.replanAt = nowMs + (zombie ? 400 : 600);
+            state.replanAt = nowMs + (zombie || hasPrey ? 400 : 600);
           }
           const r = computeBotInput(
-            zombie ? ZOMBIE_GENOME : state.genome,
+            zombie || hasPrey ? ZOMBIE_GENOME : state.genome,
             state.path, state.waypointIdx, state.physics.x, state.physics.y, cellGrid,
           );
           botInput = r.input;
@@ -1444,6 +1482,32 @@
         const botSpeedMul = botTerr === TERRAIN.SAND ? SAND_SPEED : 1; // sand slows bots too
         state.physics = stepBotPhysics(state.physics, Math.sign(bs.x), Math.sign(bs.y), cellGrid, botDt, botSpeedMul);
         revealAround(state.known, state.physics.x, state.physics.y);
+
+        // Ally touching an enemy bot is a trade: both respawn at their base.
+        if (ally) {
+          let traded = false;
+          for (const e of enemyBots) {
+            const es = botAIStates.get(e.id);
+            if (!es) continue;
+            const ddx = es.physics.x - state.physics.x, ddy = es.physics.y - state.physics.y;
+            if (ddx * ddx + ddy * ddy < ALLY_REACH * ALLY_REACH) {
+              es.physics = { x: hx, y: hy, vx: 0, vy: 0 };
+              es.path = null;
+              es.waypointIdx = 0;
+              es.lastProgress = 0;
+              es.lastProgressTime = nowMs;
+              botWrites.push({ id: e.id, x: hx, y: hy });
+              traded = true;
+              break;
+            }
+          }
+          if (traded) {
+            state = { ...state, physics: { x: homeX, y: homeY, vx: 0, vy: 0 }, path: null, waypointIdx: 0, lastProgress: 0, lastProgressTime: nowMs };
+            botAIStates.set(bot.id, state);
+            botWrites.push({ id: bot.id, x: homeX, y: homeY });
+            continue;
+          }
+        }
 
         // Bot deposits pheromone
         depositPheromone(cellGrid, state.physics.x, state.physics.y, 0.1);

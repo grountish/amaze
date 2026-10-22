@@ -13,7 +13,7 @@ import {
 } from "firebase/database";
 import { getFirebaseApp } from "./app";
 import { getCurrentUser } from "./auth";
-import type { Room, Player, GameEvent, InputSource, ShortcutState } from "./types";
+import type { Room, Player, GameEvent, InputSource, ShortcutState, BotTeam } from "./types";
 import { randomSeed, nextSeed } from "$lib/game/mazeGen";
 
 export const SINGLE_ROOM_ID = "MAIN";
@@ -302,16 +302,17 @@ export async function advanceMaze(roomId: string): Promise<void> {
     set(ref(db(), `${base}/mazeId`), String(nextSeed(seed))),
     set(ref(db(), `${base}/lap`), increment(1)),
     set(ref(db(), `${base}/mazeGrid`), null), // drop evolved deltas; fresh maze
-    set(ref(db(), `${base}/rage`), false), // fresh maze clears any zombie rage
+    set(ref(db(), `${base}/rageUntil`), null), // fresh maze clears any zombie rage
     set(ref(db(), `${base}/traps`), null), // stale traps/bombs map to old walls
   ]);
 }
 
-// Zombify-trap rage flag: when a human crosses one, every bot turns zombie
-// until the maze morphs. Leaf write (not a room-node update) so it never aborts
-// sibling trap/score transactions — same reason advanceMaze writes leaves.
-export async function setRage(roomId: string, on: boolean): Promise<void> {
-  await set(ref(db(), `rooms/${roomId}/rage`), on);
+// Zombify-trap rage expiry: when a human crosses one, every bot turns zombie
+// until `until` (epoch ms) or the maze morphs, whichever comes first. Leaf write
+// (not a room-node update) so it never aborts sibling trap/score transactions —
+// same reason advanceMaze writes leaves.
+export async function setRage(roomId: string, until: number): Promise<void> {
+  await set(ref(db(), `rooms/${roomId}/rageUntil`), until);
 }
 
 // Flip to playing AND stamp startedAt so the in-game timer actually starts.
@@ -324,37 +325,38 @@ export async function leaveRoom(roomId: string, playerId: string): Promise<void>
   await sendGameEvent(roomId, { type: "PLAYER_LEFT", playerId, createdAt: Date.now() });
 }
 
-export async function addBotPlayer(roomId: string): Promise<string> {
+export async function addBotPlayer(roomId: string, team: BotTeam = "enemy"): Promise<string> {
   // Random suffix so a tight add-loop can't collide on Date.now() (same ms).
   const botId = `bot_${Date.now()}_${Math.floor(Math.random() * 1e9)}`;
   const now = Date.now();
   const botData: Player = {
     id: botId,
-    name: "Bot",
+    name: team === "ally" ? "Ally" : "Bot",
     ready: true,
     online: true,
     inputSource: "bot",
     lastSeenAt: now,
     hp: 3,
+    ...(team === "ally" ? { team } : {}),
   };
   await set(ref(db(), `rooms/${roomId}/players/${botId}`), botData);
   return botId;
 }
 
-// Reconcile the room's bot count to exactly `target` (0 = no bots): add bots
-// if short, remove extras if over. Lets a single number input drive bots
-// directly, no separate "add" action.
-export async function setBotCount(roomId: string, target: number): Promise<void> {
+// Reconcile the room's bot count for one team to exactly `target` (0 = none):
+// add bots if short, remove extras if over. Lets a single number input drive
+// bots directly, no separate "add" action. Bots without a team are enemies.
+export async function setBotCount(roomId: string, target: number, team: BotTeam = "enemy"): Promise<void> {
   const n = Math.max(0, Math.min(50, Math.floor(target) || 0));
   const playersRef = ref(db(), `rooms/${roomId}/players`);
   const snap = await get(playersRef);
   const data = (snap.val() ?? {}) as Record<string, Player>;
   const botIds = Object.entries(data)
-    .filter(([, p]) => p.inputSource === "bot")
+    .filter(([, p]) => p.inputSource === "bot" && (p.team ?? "enemy") === team)
     .map(([id]) => id);
 
   if (botIds.length < n) {
-    for (let i = botIds.length; i < n; i++) await addBotPlayer(roomId);
+    for (let i = botIds.length; i < n; i++) await addBotPlayer(roomId, team);
   } else if (botIds.length > n) {
     const updates: Record<string, null> = {};
     for (const id of botIds.slice(n)) updates[id] = null;

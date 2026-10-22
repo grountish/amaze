@@ -41,7 +41,7 @@ export type Room = {
   lapAt?: number; // when the current lap's maze was generated
   shortcut?: ShortcutState;
   mazeGrid?: string; // base64-encoded wall bitmap
-  rage?: boolean; // true → all bots are zombies (set by zombify trap, cleared on morph)
+  rageUntil?: number; // epoch ms; all bots are zombies until then (set by zombify trap, cleared on morph)
 };
 
 export type Player = {
@@ -56,7 +56,10 @@ export type Player = {
   lastSeenAt?: number;
   score?: number; // laps won (endless morph)
   hp?: number; // shots-to-die health; respawns at 0 (see MAX_HP)
+  team?: BotTeam; // bots only: "ally" fights for the humans; unset = enemy
 };
+
+export type BotTeam = "ally" | "enemy";
 
 export type GameEvent =
   | {

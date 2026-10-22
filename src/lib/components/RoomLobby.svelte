@@ -4,7 +4,7 @@
   import { setupPresence } from "$lib/firebase/presence";
   import { players, currentPlayerId } from "$lib/stores/playerStore";
   import { room } from "$lib/stores/roomStore";
-  import type { InputSource } from "$lib/firebase/types";
+  import type { InputSource, BotTeam } from "$lib/firebase/types";
 
   export let roomId: string;
   export let playerName: string;
@@ -17,10 +17,12 @@
   let cleanupPresence: (() => void) | null = null;
   let gameStarted = false;
   let isReady = false;
+  // Bot counts per team (enemy = classic bots; ally = fights for the humans).
   let botCount = 0;
-  let botCountInit = false; // seed the input from the room's current bots once
-  let botSyncBusy = false;
-  let botPending = false;
+  let allyCount = 0;
+  let botCountInit = false; // seed the inputs from the room's current bots once
+  const botSyncBusy: Record<BotTeam, boolean> = { enemy: false, ally: false };
+  const botPending: Record<BotTeam, boolean> = { enemy: false, ally: false };
   let restarting = false;
   // True if a game was already in progress when we arrived — then we don't
   // auto-enter; the user explicitly chooses Join Game or Restart for all.
@@ -53,25 +55,29 @@
     await setPlayerReady(roomId, myId, isReady);
   }
 
-  // The bot input is the source of truth: reconcile the room to its value.
-  // Coalesces rapid edits so the room converges to the latest number.
-  async function syncBots() {
-    botCount = Math.max(0, Math.min(50, Math.floor(botCount) || 0));
-    if (botSyncBusy) { botPending = true; return; }
-    botSyncBusy = true;
+  const clampBots = (n: number) => Math.max(0, Math.min(50, Math.floor(n) || 0));
+
+  // The bot inputs are the source of truth: reconcile the room to their values.
+  // Coalesces rapid edits (per team) so the room converges to the latest number.
+  async function syncBots(team: BotTeam) {
+    botCount = clampBots(botCount);
+    allyCount = clampBots(allyCount);
+    if (botSyncBusy[team]) { botPending[team] = true; return; }
+    botSyncBusy[team] = true;
     try {
       do {
-        botPending = false;
-        await setBotCount(roomId, botCount);
-      } while (botPending);
+        botPending[team] = false;
+        await setBotCount(roomId, team === "ally" ? allyCount : botCount, team);
+      } while (botPending[team]);
     } finally {
-      botSyncBusy = false;
+      botSyncBusy[team] = false;
     }
   }
 
-  function stepBots(delta: number) {
-    botCount = (Math.floor(botCount) || 0) + delta;
-    syncBots();
+  function stepBots(team: BotTeam, delta: number) {
+    if (team === "ally") allyCount = clampBots(allyCount + delta);
+    else botCount = clampBots(botCount + delta);
+    syncBots(team);
   }
 
   async function commitName() {
@@ -148,8 +154,14 @@
   // Humans listed individually; bots collapsed into a single anonymous count.
   $: humans = $players.filter((p) => p.inputSource !== "bot");
   $: botList = $players.filter((p) => p.inputSource === "bot");
-  // Seed the bot input from the room's current bots once (e.g. rejoining).
-  $: if (!botCountInit && $players.length > 0) { botCount = botList.length; botCountInit = true; }
+  $: allyList = botList.filter((p) => p.team === "ally");
+  $: enemyList = botList.filter((p) => p.team !== "ally");
+  // Seed the bot inputs from the room's current bots once (e.g. rejoining).
+  $: if (!botCountInit && $players.length > 0) {
+    botCount = enemyList.length;
+    allyCount = allyList.length;
+    botCountInit = true;
+  }
 
   const CONTROL_LABEL: Record<InputSource, string> = {
     keyboard: "Keyboard",
@@ -208,7 +220,7 @@
 
       <div class="field-label row-label">
         <span>Players</span>
-        <span class="count">{humans.length} human{humans.length === 1 ? "" : "s"} · {botList.length} bot{botList.length === 1 ? "" : "s"}</span>
+        <span class="count">{humans.length} human{humans.length === 1 ? "" : "s"} · {allyList.length} all{allyList.length === 1 ? "y" : "ies"} · {enemyList.length} enem{enemyList.length === 1 ? "y" : "ies"}</span>
       </div>
       <ul class="player-list">
         {#each humans as player (player.id)}
@@ -228,23 +240,47 @@
       </ul>
 
       <div class="bots">
-        <div class="bots-text">
-          <span class="bots-title">Bots</span>
-          <span class="bots-sub">Half race you, half hunt you</span>
+        <div class="bot-row">
+          <span class="team-dot ally" aria-hidden="true" />
+          <div class="bots-text">
+            <span class="bots-title">Allies</span>
+            <span class="bots-sub">Escort you, hunt zombies, race for the lair</span>
+          </div>
+          <div class="stepper" role="group" aria-label="Number of ally bots">
+            <button type="button" on:click={() => stepBots("ally", -1)} disabled={allyCount <= 0} aria-label="Fewer allies">−</button>
+            <input
+              id="allyCount"
+              type="number"
+              min="0"
+              max="50"
+              inputmode="numeric"
+              bind:value={allyCount}
+              on:change={() => syncBots("ally")}
+              aria-label="Number of ally bots"
+            />
+            <button type="button" on:click={() => stepBots("ally", 1)} disabled={allyCount >= 50} aria-label="More allies">+</button>
+          </div>
         </div>
-        <div class="stepper" role="group" aria-label="Number of bots">
-          <button type="button" on:click={() => stepBots(-1)} disabled={botCount <= 0} aria-label="Fewer bots">−</button>
-          <input
-            id="botCount"
-            type="number"
-            min="0"
-            max="50"
-            inputmode="numeric"
-            bind:value={botCount}
-            on:change={syncBots}
-            aria-label="Number of bots"
-          />
-          <button type="button" on:click={() => stepBots(1)} disabled={botCount >= 50} aria-label="More bots">+</button>
+        <div class="bot-row">
+          <span class="team-dot enemy" aria-hidden="true" />
+          <div class="bots-text">
+            <span class="bots-title">Enemies</span>
+            <span class="bots-sub">Half race to your home, half hunt you</span>
+          </div>
+          <div class="stepper" role="group" aria-label="Number of enemy bots">
+            <button type="button" on:click={() => stepBots("enemy", -1)} disabled={botCount <= 0} aria-label="Fewer enemies">−</button>
+            <input
+              id="botCount"
+              type="number"
+              min="0"
+              max="50"
+              inputmode="numeric"
+              bind:value={botCount}
+              on:change={() => syncBots("enemy")}
+              aria-label="Number of enemy bots"
+            />
+            <button type="button" on:click={() => stepBots("enemy", 1)} disabled={botCount >= 50} aria-label="More enemies">+</button>
+          </div>
         </div>
       </div>
 
@@ -298,7 +334,7 @@
             </li>
             <li>
               <span class="num">3</span>
-              <div><strong>Survive the bots.</strong> Racer bots head for <em>your</em> home keep. Red zombie bots hunt you, and touching one sends you back to the start.</div>
+              <div><strong>Survive the bots.</strong> Enemy racer bots head for <em>your</em> home keep. Red zombie bots hunt you, and touching one sends you back to the start. Add blue ally bots to escort you: they chase zombies, take out any enemy bot they touch (and respawn), and can win laps for you.</div>
             </li>
             <li>
               <span class="num">4</span>
@@ -343,8 +379,9 @@
 
             <h3>Hazards</h3>
             <div class="item"><span class="sw ring" style="--c:#ff3c28" /><div><strong>Trap</strong>: flashes orange while arming, then turns red. A red trap sends you back to start.</div></div>
-            <div class="item"><span class="sw ring" style="--c:#3cdc50" /><div><strong>Zombify trap</strong>: turns every bot into a zombie until the next maze.</div></div>
+            <div class="item"><span class="sw ring" style="--c:#3cdc50" /><div><strong>Zombify trap</strong>: turns every bot into a zombie for 1 minute (or until the next maze).</div></div>
             <div class="item"><span class="sw orb solid" style="--c:#e0241c" /><div><strong>Red marble</strong>: a zombie. Shoot it or run.</div></div>
+            <div class="item"><span class="sw orb solid ally" style="--c:#3d8bff" /><div><strong>Blue marble with white ring</strong>: your ally. Your shots and bombs don't hurt it.</div></div>
             <div class="item"><span class="sw wall" style="--c:#ff2a2a" /><div><strong>Armored wall</strong>: shots can't break it. It turns red once you've hit it.</div></div>
 
             <h3>Terrain</h3>
@@ -557,15 +594,22 @@
 
   .bots {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
+    flex-direction: column;
     margin: 1.1rem 0 1.25rem;
-    padding: 0.75rem 0.85rem;
     border-radius: 12px;
     background: var(--surface-2);
   }
-  .bots-text { display: flex; flex-direction: column; gap: 0.15rem; }
+  .bot-row {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.7rem 0.85rem;
+  }
+  .bot-row + .bot-row { border-top: 1px solid var(--line); }
+  .team-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .team-dot.ally { background: #3d8bff; box-shadow: 0 0 0 2px #fff inset; }
+  .team-dot.enemy { background: #e0241c; }
+  .bots-text { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; min-width: 0; }
   .bots-title { font-weight: 700; font-size: 0.95rem; }
   .bots-sub { font-size: 0.78rem; color: var(--muted); }
   .stepper {
@@ -803,6 +847,7 @@
     box-shadow: 0 0 10px -2px var(--c);
   }
   .sw.orb.solid { background: var(--c); box-shadow: none; border: 2px solid #6e0a06; }
+  .sw.orb.solid.ally { border-color: #fff; }
   .sw.ring { border-radius: 50%; border: 3px solid var(--c); }
   .sw.tile { border-radius: 4px; background: var(--c); opacity: 0.85; }
   .sw.wall { border-radius: 3px; background: var(--c); width: 20px; height: 10px; margin-top: 6px; }
